@@ -1,0 +1,18 @@
+PLACEHOLDER - NOT THE ACTUAL BINARY
+
+This file is a stand-in for the Antarctica ASPA135 terrain DEM (GeoTIFF).
+The real binary lives in upstream as a Git LFS object (~16 MB).
+
+Upstream reference:
+  Repository : https://github.com/dipraj-debnath/ROS2_MultiUAV_3D
+  Path       : aerostack_examples/02_examples_gazebo_project/project_gazebo/models/aspa135_mini3/maps/A135_Mini3Pro-DEM-UTM_gr_altfixed_ROI_gz_fx_2049.tif
+  LFS OID    : c927ec92b9b0db8bbb4ad3288d3716e8c62dc84b24854548b88a30a14cd625f8 (sha-256)
+  LFS bytes  : 16806419
+
+To restore the real terrain DEM:
+  git clone https://github.com/dipraj-debnath/ROS2_MultiUAV_3D /tmp/upstream
+  cd /tmp/upstream && git lfs install && git lfs pull
+  cp /tmp/upstream/aerostack_examples/02_examples_gazebo_project/project_gazebo/models/aspa135_mini3/maps/A135_Mini3Pro-DEM-UTM_gr_altfixed_ROI_gz_fx_2049.tif <repo>/aerostack_examples/02_examples_gazebo_project/project_gazebo/models/aspa135_mini3/maps/
+
+After restoring, re-enable LFS tracking in .gitattributes if you intend to
+re-commit it (see .gitattributes for the line to add).

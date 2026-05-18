@@ -1,0 +1,8 @@
+# LFS routing for Antarctica assets is intentionally disabled in this fork.
+# The .tif (terrain DEM) and .dae (thermal overlay mesh) under
+# aerostack_examples/.../models/aspa135_mini3*/ are committed as their LFS
+# pointer text. To restore the real binaries, clone the upstream repo
+# (dipraj-debnath/ROS2_MultiUAV_3D) with `git lfs pull` and copy them in,
+# or re-enable LFS tracking with:
+#   *.dae filter=lfs diff=lfs merge=lfs -text
+#   *.tif filter=lfs diff=lfs merge=lfs -text
