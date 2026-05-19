@@ -70,14 +70,14 @@ class ObstaclesVizNode(Node):
         self.obstacle_xyz = np.asarray(data["obstacle_xyz"], dtype=float)
         raw_size = np.asarray(data["obs_size"], dtype=float)
 
-        # Normalise obs_size to 1-D (N,) — each entry is the half-size scalar
+        # Normalise obs_size to (N, 3) per-axis half-sizes.
+        n = len(self.obstacle_xyz)
         if raw_size.ndim == 0:
-            self.obs_size = np.full(len(self.obstacle_xyz), float(raw_size))
+            self.obs_size = np.tile(float(raw_size), (n, 3))
         elif raw_size.ndim == 1:
-            self.obs_size = raw_size
+            self.obs_size = np.tile(raw_size[:, None], (1, 3))
         else:
-            # (N, 3) — take the mean of the three dimensions as a scalar size
-            self.obs_size = raw_size.mean(axis=1)
+            self.obs_size = raw_size                          # already (N, 3)
 
         self.get_logger().info(
             f"Loaded {len(self.obstacle_xyz)} obstacles from {pkl_path.name}"
@@ -108,11 +108,10 @@ class ObstaclesVizNode(Node):
             m.pose.position.z = float(center[2])
             m.pose.orientation.w = 1.0
 
-            # Full cube side = 2 * half_size
-            side = float(half) * 2.0
-            m.scale.x = side
-            m.scale.y = side
-            m.scale.z = side
+            # Full side per axis = 2 * half_size
+            m.scale.x = 2.0 * float(half[0])
+            m.scale.y = 2.0 * float(half[1])
+            m.scale.z = 2.0 * float(half[2])
 
             m.color.r = 1.0
             m.color.g = 0.0

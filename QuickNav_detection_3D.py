@@ -76,11 +76,20 @@ def obstacle_detection(route, obstacle_xyz, obs_size, visualize=True, eps=1e-6):
     return Obstacle_route, new_ob, obs_route
 
 
-def line_intersects_cube(p1, p2, cube_min, cube_max):
+def line_intersects_cube(p1, p2, cube_min, cube_max, eps=1e-4):
     """
     Slab-based AABB ray intersection test.
-    Returns True if the segment p1→p2 intersects the axis-aligned box [cube_min, cube_max].
+
+    Returns True if the segment p1→p2 penetrates the INTERIOR of the axis-aligned
+    box [cube_min, cube_max]. The box is shrunk by `eps` on every axis so that
+    segments touching a face, edge, or corner (e.g. QuickNav detour corners that
+    sit on an obstacle's surface by construction) are NOT counted as intersections.
     """
+    cube_min = np.asarray(cube_min, dtype=float) + eps
+    cube_max = np.asarray(cube_max, dtype=float) - eps
+    if np.any(cube_min >= cube_max):
+        return False  # obstacle smaller than 2*eps on some axis -> no interior
+
     d = p2 - p1
     tmin, tmax = 0.0, 1.0
     for i in range(3):
@@ -101,11 +110,18 @@ def line_intersects_cube(p1, p2, cube_min, cube_max):
 
 
 def draw_cube(ax, center, size):
-    """Draw a wireframe cube on a matplotlib 3D axes."""
-    r = [-size, size]
+    """Draw a wireframe box on a matplotlib 3D axes.
+
+    `size` may be a scalar (cube) or a 3-vector (per-axis half-sizes).
+    """
+    if np.isscalar(size):
+        sx = sy = sz = float(size)
+    else:
+        sx, sy, sz = (float(v) for v in size)
+
     verts = np.array([
-        [center[0] + x, center[1] + y, center[2] + z]
-        for x in r for y in r for z in r
+        [center[0] + x * sx, center[1] + y * sy, center[2] + z * sz]
+        for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)
     ])
     faces = [
         [verts[0], verts[1], verts[3], verts[2]],

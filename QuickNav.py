@@ -37,23 +37,12 @@ def apply_quicknav(route, obstacle_xyz, obs_size, max_iterations=10):
         return np.array(result)
 
     iteration = 0
-    processed_obstacles = []
 
     while iteration < max_iterations:
         iteration += 1
         Obstacle_route, new_ob, obs_route = obstacle_detection(
             route, obstacle_xyz, obs_size, visualize=False
         )
-
-        # Skip obstacles whose centres have already been processed.
-        if processed_obstacles:
-            mask = np.array([
-                not any(np.allclose(ob, po, atol=1e-6) for po in processed_obstacles)
-                for ob in new_ob
-            ], dtype=bool)
-            new_ob = new_ob[mask]
-            Obstacle_route = Obstacle_route[mask]
-            obs_route = obs_route[mask]
 
         if len(new_ob) == 0:
             break
@@ -85,12 +74,36 @@ def apply_quicknav(route, obstacle_xyz, obs_size, max_iterations=10):
             idx = np.where((obstacle_xyz == detected_ob).all(axis=1))[0]
             matched_sizes.append(obs_size[idx[0]] if len(idx) > 0 else 1.0)
 
+        # Pass the FULL obstacle list so obstacle_avoid can filter detour
+        # candidates against every obstacle, not just the one being detoured.
         try:
             Obstacle_avoid_route = obstacle_avoid(
-                Obstacle_route, new_ob, new_ob, np.array(matched_sizes)
+                Obstacle_route, new_ob, obstacle_xyz, obs_size,
+                current_sizes=np.array(matched_sizes),
             )
-        except Exception:
+        except Exception as e:
+            print(f"[QuickNav] obstacle_avoid raised {type(e).__name__}: {e}; aborting.")
             break
+
+        # Bug-D fix part 1: sort by segment index so the splice loop, which
+        # uses a monotonic `index += 2` correction, processes detours in
+        # left-to-right order. obstacle_detection iterates obstacles-then-
+        # segments, so without this sort an upstream detour can overwrite an
+        # earlier-spliced one.
+        sort_idx = np.argsort(obs_route[:, 0].astype(int))
+        obs_route = obs_route[sort_idx]
+        Obstacle_avoid_route = Obstacle_avoid_route[:, :, sort_idx]
+
+        # Bug-D fix part 2: when multiple obstacles share a single segment, the
+        # splice logic cannot install more than one detour per segment without
+        # overwriting. Keep only the FIRST detection per unique segment and let
+        # the next outer iteration handle the rest (the spliced detour breaks
+        # the original segment into shorter ones, so further obstacles are
+        # detected against those shorter pieces).
+        _, first_per_seg = np.unique(obs_route[:, 0].astype(int), return_index=True)
+        first_per_seg = np.sort(first_per_seg)
+        obs_route = obs_route[first_per_seg]
+        Obstacle_avoid_route = Obstacle_avoid_route[:, :, first_per_seg]
 
         # Splice avoidance detours into route
         Final = route.copy()
@@ -118,11 +131,22 @@ def apply_quicknav(route, obstacle_xyz, obs_size, max_iterations=10):
                 Final = np.vstack([part1, part2, part3])
                 index += 2
 
-        processed_obstacles.extend(new_ob.tolist())
-
         if np.array_equal(route, Final):
             break
         route = Final
+    else:
+        # while-loop exhausted without break: max_iterations hit without convergence.
+        # Surface unresolved collisions so the caller sees the failure rather than
+        # silently flying an unsafe path.
+        Obstacle_route, new_ob, obs_route = obstacle_detection(
+            route, obstacle_xyz, obs_size, visualize=False
+        )
+        if len(new_ob) > 0:
+            print(
+                f"[QuickNav] WARNING: max_iterations={max_iterations} reached with "
+                f"{len(new_ob)} unresolved obstacle intersection(s). "
+                f"Returned path is NOT collision-free."
+            )
 
     route = deduplicate_preserve_order(route)
     return route

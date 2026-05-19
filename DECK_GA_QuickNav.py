@@ -59,6 +59,41 @@ def load_points(pkl_path: Path) -> np.ndarray:
     return arr
 
 
+def load_obstacles(pkl_path: Path, fallback_size: float):
+    """Auto-detect dict-pkl vs legacy Nx3 obstacle file.
+
+    Returns
+    -------
+    centers : (N, 3) ndarray
+    sizes   : (N, 3) ndarray  — per-axis half-sizes
+
+    Dict format: {'centers': (N,3), 'sizes': (N,3) or (N,), 'meta': {...}}
+    Legacy:     bare (N,3) numpy array of centres; sizes filled from fallback_size.
+    """
+    with pkl_path.open("rb") as f:
+        obj = pickle.load(f)
+
+    if isinstance(obj, dict) and "centers" in obj and "sizes" in obj:
+        centers = np.asarray(obj["centers"], dtype=float)
+        sizes = np.asarray(obj["sizes"], dtype=float)
+        if sizes.ndim == 1:
+            sizes = np.tile(sizes[:, None], (1, 3))
+        if centers.ndim != 2 or centers.shape[1] != 3:
+            raise ValueError(f"dict centers must be (N,3), got {centers.shape}")
+        if sizes.shape != centers.shape:
+            raise ValueError(
+                f"dict sizes shape {sizes.shape} doesn't match centers {centers.shape}"
+            )
+        print(f"  (dict-format obstacles: per-axis sizes embedded; --obs_size ignored)")
+        return centers, sizes
+
+    arr = np.asarray(obj, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        raise ValueError(f"Legacy obstacles must be Nx3. Got shape={arr.shape} from {pkl_path}")
+    sizes = np.full((len(arr), 3), float(fallback_size))
+    return arr, sizes
+
+
 def calculate_path_distance(path: np.ndarray) -> float:
     path = np.asarray(path, dtype=float)
     if len(path) < 2:
@@ -144,16 +179,22 @@ def main():
     # Step 1: Load waypoints + obstacles
     # -------------------------------------------------------
     points = load_points(points_path)
-    obstacle_xyz = load_points(obstacles_path)
-    obs_size = np.full(len(obstacle_xyz), float(args.obs_size))
+    obstacle_xyz, obs_size = load_obstacles(obstacles_path, fallback_size=args.obs_size)
 
     num_points = len(points)
     num_uavs = args.num_uavs
     start_points = parse_start_points(args.start_points, num_uavs)
 
+    # obs_size summary line — adaptive to scalar vs per-axis content.
+    if np.allclose(obs_size, obs_size[0, 0]):
+        size_str = f"uniform={float(obs_size[0, 0]):.3f}"
+    else:
+        smin, smax = float(obs_size.min()), float(obs_size.max())
+        size_str = f"per-axis range=[{smin:.3f}, {smax:.3f}]"
+
     print("\n--- INPUT ---")
     print(f"Points file    : {points_path}  ({num_points} pts)")
-    print(f"Obstacles file : {obstacles_path}  ({len(obstacle_xyz)} obstacles, size={args.obs_size})")
+    print(f"Obstacles file : {obstacles_path}  ({len(obstacle_xyz)} obstacles, {size_str})")
     print(f"Num UAVs       : {num_uavs}")
     print(f"Start pts      : {start_points}")
 
@@ -297,14 +338,17 @@ def main():
     # Step 8: Plotting
     # -------------------------------------------------------
     if not args.no_plot:
+        from QuickNav_detection_3D import draw_cube  # local: drawn only when plotting
+
         fig_combined = plt.figure(figsize=(5, 3.5), dpi=200)
         ax = fig_combined.add_subplot(111, projection="3d")
         ax.set_title("DECK-GA + QuickNav Paths", fontsize=10)
         colors = cm.rainbow(np.linspace(0, 1, num_uavs))
 
-        # Draw obstacles
-        for obs_c in obstacle_xyz:
+        # Draw obstacles: centre marker + per-axis box wireframe
+        for obs_c, obs_s in zip(obstacle_xyz, obs_size):
             ax.scatter(*obs_c, c="red", marker="x", s=60)
+            draw_cube(ax, obs_c, obs_s)
 
         # Draw deckga paths (dashed) and quicknav paths (solid)
         for i in range(len(deckga_paths)):
@@ -330,8 +374,9 @@ def main():
                 ax2.plot(qp[:, 0], qp[:, 1], qp[:, 2], "*-", label=f"UAV {i+1} QuickNav")
                 ax2.scatter(qp[0, 0], qp[0, 1], qp[0, 2], c="red", s=100, marker="o",
                             label="Start")
-                for obs_c in obstacle_xyz:
+                for obs_c, obs_s in zip(obstacle_xyz, obs_size):
                     ax2.scatter(*obs_c, c="red", marker="x", s=60)
+                    draw_cube(ax2, obs_c, obs_s)
                 ax2.set_title(f"QuickNav Path UAV {i+1}")
                 ax2.set_xlabel("X"); ax2.set_ylabel("Y"); ax2.set_zlabel("Z")
                 ax2.legend()
