@@ -1,0 +1,18 @@
+# Frame names for the stock as2_state_estimator node.
+#
+# Byte-for-byte the same content as
+#   /opt/ros/humble/share/as2_state_estimator/config/state_estimator_default.yaml
+# It is duplicated here only so this package's launch file has a default it owns
+# and does not silently change meaning if the installed as2_state_estimator is
+# upgraded underneath it. Pass config_file:=<path> to override.
+#
+# base_frame, odom_frame and map_frame are namespaced by
+# as2::tf::generateTfName() into "<namespace>/<frame>". global_ref_frame is NOT
+# namespaced -- "earth" is shared by every drone in the session, which is exactly
+# why defect D2 (a per-drone earth->map decided by start order) mattered.
+/**:
+  ros__parameters:
+    base_frame: "base_link"      # Base frame of the robot
+    global_ref_frame: "earth"    # Global reference frame (never namespaced)
+    odom_frame: "odom"           # Odometry frame of the robot
+    map_frame: "map"             # Map frame

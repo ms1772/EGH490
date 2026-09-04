@@ -1,0 +1,33 @@
+<!--
+  Plugin description for as2_mocap_guarded.
+
+  Registered against the as2_state_estimator base package by
+  pluginlib_export_plugin_description_file(as2_state_estimator plugins.xml) in
+  CMakeLists.txt, which writes
+    share/ament_index/resource_index/as2_state_estimator__pluginlib__plugin/as2_mocap_guarded
+  The stock as2_state_estimator node constructs
+    pluginlib::ClassLoader<as2_state_estimator_plugin_base::StateEstimatorBase>(
+        "as2_state_estimator", "as2_state_estimator_plugin_base::StateEstimatorBase")
+  which scans that resource index across EVERY prefix on AMENT_PREFIX_PATH, so this
+  file is found without touching the installed as2_state_estimator package.
+
+  The node's lookup name is `<plugin_name parameter> + "::Plugin"`, so
+    plugin_name: "mocap_pose_guarded"   ->   mocap_pose_guarded::Plugin
+  and `path` must match the library built by CMake (libmocap_pose_guarded.so).
+
+  The name is deliberately distinct from the stock `mocap_pose` so the two can
+  never be confused in a config file or a log line.
+-->
+<class_libraries>
+  <library path="mocap_pose_guarded">
+    <class type="mocap_pose_guarded::Plugin"
+           base_class_type="as2_state_estimator_plugin_base::StateEstimatorBase">
+      <description>
+        Hardened mocap/OptiTrack state estimator plugin (S1). Drops name-mismatched
+        and malformed samples instead of publishing an origin pose, takes earth-&gt;map
+        from parameters (identity by default), filters differentiated velocity, and
+        publishes /{ns}/mocap_health.
+      </description>
+    </class>
+  </library>
+</class_libraries>

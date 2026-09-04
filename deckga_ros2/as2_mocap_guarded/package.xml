@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>as2_mocap_guarded</name>
+  <version>1.0.0</version>
+  <description>
+    S1: a hardened fork of the Aerostack2 as2_state_estimator `mocap_pose` plugin.
+    Drops messages whose configured rigid body is absent instead of publishing the
+    origin, takes earth-&gt;map from parameters (identity by default) instead of
+    latching it from the first sample received, validates incoming samples, filters
+    the differentiated velocity by default, and publishes a mocap_health topic.
+    Sits alongside the stock as2_state_estimator; does not modify it.
+  </description>
+
+  <maintainer email="mitchsolomon72@gmail.com">Mitchell Solomon</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>pluginlib</depend>
+  <depend>as2_core</depend>
+  <depend>as2_state_estimator</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>mocap4r2_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

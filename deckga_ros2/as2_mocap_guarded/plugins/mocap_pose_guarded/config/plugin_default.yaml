@@ -1,0 +1,45 @@
+# Default parameters for the mocap_pose_guarded state-estimator plugin (S1).
+#
+# Wildcard node name so the same file works for any drone namespace.
+#
+# rigid_body_name has NO usable default on purpose. A wrong or missing rigid body
+# name is defect D1 -- the reason this fork exists -- so the plugin throws at
+# setup rather than starting and quietly tracking nothing. Set it per drone:
+#   ros2 launch as2_mocap_guarded mocap_pose_guarded_state_estimator.launch.py \
+#       namespace:=drone0 rigid_body_name:=drone0
+/**:
+  ros__parameters:
+    # ---- source -----------------------------------------------------------
+    mocap_topic: "/mocap/rigid_bodies"   # mocap4r2_msgs/RigidBodies input
+    rigid_body_name: ""                  # MUST be set; must match Motive exactly
+    # D5: mocap4r2 drivers and flight_ops/nodes/vrpn_to_rigidbodies.py both publish
+    # this topic BEST_EFFORT. Upstream hard-codes a RELIABLE subscription, which
+    # matches nothing and delivers zero messages in total silence. Use "reliable"
+    # only if the source is genuinely reliable.
+    mocap_qos_reliability: "best_effort"  # best_effort | reliable | system_default
+
+    # ---- D2: earth->map, from parameters, identity by default -------------
+    # Identity means earth == map == the lab frame for every drone, regardless of
+    # which process started first. Only change these if the lab frame origin is
+    # deliberately offset from the mocap origin -- and then change them for ALL
+    # drones in the session.
+    earth_to_map_x: 0.0                  # m
+    earth_to_map_y: 0.0                  # m
+    earth_to_map_z: 0.0                  # m
+    earth_to_map_yaw: 0.0                # rad
+
+    # ---- D3: velocity smoothing -------------------------------------------
+    # 0.2 => ~3.2 Hz corner, ~40 ms lag, 3x less differentiation noise at 100 Hz.
+    # 1.0 reproduces the upstream default (filter OFF).
+    twist_smooth_filter_cte: 0.2
+    # Left at 1.0 (off): the blend is component-wise and does not renormalise.
+    orientation_smooth_filter_cte: 1.0
+
+    # ---- D4: input validation ---------------------------------------------
+    quaternion_tolerance: 0.001          # |norm(q) - 1| above this => sample dropped
+
+    # ---- health ------------------------------------------------------------
+    mocap_timeout: 0.25                  # s without a good sample => tracked:false
+    mocap_health_topic: "mocap_health"   # relative => /{namespace}/mocap_health
+    mocap_health_rate: 2.0               # Hz, timer-driven; survives mocap silence
+    log_throttle_period: 2.0             # s between repeated fault log lines
