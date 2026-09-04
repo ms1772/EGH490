@@ -1,0 +1,75 @@
+# Refuse-to-proceed gates and the managed-parameter allow-list.
+#
+# Consumed by flight_ops/snapshot.py. Two independent jobs:
+#
+#   gates.must_equal      Hard expected values. A mismatch means the shared
+#                         hardware is not in the state this project left it in
+#                         -- most likely someone else's setup is live. ABORT.
+#
+#   gates.baseline_compare  Glob patterns. Any parameter matching one of these
+#                         that differs from the reference snapshot is reported.
+#                         Differences are a stop-and-ask, not an auto-abort,
+#                         because legitimate tuning lands here too.
+#
+#   managed_params        The ONLY parameters this project is ever allowed to
+#                         write. Applied in listed order; rollback restores in
+#                         strict reverse order from the snapshot's captured
+#                         values. Values live in px4_indoor_params.yaml (S5),
+#                         deliberately NOT here -- this file is about what may
+#                         be touched, not what it is set to.
+
+gates:
+  must_equal:
+    # uXRCE-DDS transport over Ethernet. If any of these have moved, the FC is
+    # configured for someone else's session. Do not proceed, do not "fix" it.
+    UXRCE_DDS_CFG: 1000        # Ethernet
+    UXRCE_DDS_PRT: 8888
+    UXRCE_DDS_KEY: 1
+    UXRCE_DDS_DOM_ID: 0
+
+  baseline_compare:
+    - "EKF2_*"
+    - "MPC_*"
+    - "COM_*"
+    - "GF_*"
+    - "RTL_*"
+    - "UXRCE_*"
+
+# Applied in this order. Rollback walks it backwards.
+managed_params:
+  # --- external vision aiding (indoor mocap) -------------------------------
+  - EKF2_EV_DELAY            # vision latency compensation
+  - EKF2_EV_CTRL             # which vision measurements are fused
+  - EKF2_GPS_CTRL            # GPS aiding off indoors
+  - EKF2_HGT_REF             # height reference source
+  - EKF2_EVP_NOISE           # vision position noise
+  - EKF2_EVA_NOISE           # vision angle noise
+
+  # --- indoor envelope limits ----------------------------------------------
+  - MPC_XY_VEL_MAX
+  - MPC_XY_CRUISE
+  - MPC_Z_VEL_MAX_UP
+  - MPC_Z_VEL_MAX_DN
+  - MPC_TILTMAX_AIR
+
+  # --- geofence ------------------------------------------------------------
+  - GF_ACTION
+  - GF_MAX_HOR_DIST
+  - GF_MAX_VER_DIST
+
+  # --- failsafe behaviour ---------------------------------------------------
+  # In an 8x6x4 m netted volume the offboard-loss action must be Land.
+  # RTL_RETURN_ALT=2 is a manoeuvre in this room, not a return.
+  - COM_OBL_RC_ACT
+  - COM_POS_FS_DELAY
+  - COM_DISARM_LAND
+  - NAV_DLL_ACT
+  - RTL_RETURN_ALT
+  - RTL_DESCEND_ALT
+
+# Hosts that snapshot.py will try to reach over ssh (BatchMode only -- set up
+# key auth first; no password is ever stored in this repo).
+hosts:
+  - name: jetson-drone3
+    user: jetson
+    addr: 10.88.51.230
