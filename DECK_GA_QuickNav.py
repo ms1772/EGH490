@@ -43,6 +43,11 @@ from DCKmeans import manual_kmeans_clustering
 from GA_path_planning import ga_3d_pathplanning
 from QuickNav import apply_quicknav
 
+try:
+    from perception.octomap_to_obstacles import octomap_to_aabbs
+except Exception:  # pragma: no cover - only relevant when --octomap is used
+    octomap_to_aabbs = None
+
 matplotlib.rc("font", family="sans-serif")
 
 
@@ -59,7 +64,7 @@ def load_points(pkl_path: Path) -> np.ndarray:
     return arr
 
 
-def load_obstacles(pkl_path: Path, fallback_size: float):
+def load_obstacles_from_pkl(pkl_path: Path, fallback_size: float):
     """Auto-detect dict-pkl vs legacy Nx3 obstacle file.
 
     Returns
@@ -148,8 +153,19 @@ def main():
     )
     ap.add_argument("--points_pkl", default="data/points/points_current.pkl",
                     help="Pkl file with Nx3 waypoint array")
-    ap.add_argument("--obstacles_pkl", required=True,
-                    help="Pkl file with Nx3 obstacle centre array (same format as points pkl)")
+    ap.add_argument("--obstacles_pkl", default=None,
+                    help="Pkl file with Nx3 or dict obstacles (mutually exclusive with --octomap)")
+    ap.add_argument("--octomap", default=None,
+                    help="OctoMap .bt file; obstacles extracted in-process "
+                         "(mutually exclusive with --obstacles_pkl)")
+    ap.add_argument("--octomap-safety", dest="octomap_safety", type=float, default=0.5,
+                    help="Safety inflation (m) applied when building AABBs from octomap")
+    ap.add_argument("--octomap-fill-threshold", dest="octomap_fill_threshold",
+                    type=float, default=0.05,
+                    help="Fill-ratio threshold for AABB splitting from octomap")
+    ap.add_argument("--octomap-max-split-depth", dest="octomap_max_split_depth",
+                    type=int, default=3,
+                    help="Max recursive median-axis split depth for octomap AABBs")
     ap.add_argument("--obs_size", type=float, default=5.0,
                     help="Uniform half-size for all obstacle cubes (default: 5.0)")
     ap.add_argument("--out_pkl", default="deckga_ros2/data/deckga_quicknav_output.pkl",
@@ -169,8 +185,10 @@ def main():
         p = Path(p)
         return p if p.is_absolute() else (repo_root / p).resolve()
 
+    if (args.obstacles_pkl is None) == (args.octomap is None):
+        ap.error("exactly one of --obstacles_pkl or --octomap must be supplied")
+
     points_path = resolve(args.points_pkl)
-    obstacles_path = resolve(args.obstacles_pkl)
     out_path = resolve(args.out_pkl)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     save_dir = resolve(args.save_fig_dir) if args.save_fig_dir else None
@@ -179,14 +197,37 @@ def main():
     # Step 1: Load waypoints + obstacles
     # -------------------------------------------------------
     points = load_points(points_path)
-    obstacle_xyz, obs_size = load_obstacles(obstacles_path, fallback_size=args.obs_size)
+
+    if args.obstacles_pkl is not None:
+        obstacles_path = resolve(args.obstacles_pkl)
+        obstacle_xyz, obs_size = load_obstacles_from_pkl(
+            obstacles_path, fallback_size=args.obs_size
+        )
+        obs_source_str = f"pkl   : {obstacles_path}"
+    else:
+        if octomap_to_aabbs is None:
+            ap.error("octomap support unavailable — perception.octomap_to_obstacles failed to import")
+        octomap_path = resolve(args.octomap)
+        obstacle_xyz, obs_size, _octo_meta = octomap_to_aabbs(
+            octomap_path,
+            s_safety=args.octomap_safety,
+            tau_fill=args.octomap_fill_threshold,
+            max_split_depth=args.octomap_max_split_depth,
+        )
+        obs_source_str = (
+            f"octomap: {octomap_path}  "
+            f"(res={_octo_meta['resolution']}, "
+            f"leaves={_octo_meta['n_occupied_leaves']})"
+        )
 
     num_points = len(points)
     num_uavs = args.num_uavs
     start_points = parse_start_points(args.start_points, num_uavs)
 
     # obs_size summary line — adaptive to scalar vs per-axis content.
-    if np.allclose(obs_size, obs_size[0, 0]):
+    if len(obs_size) == 0:
+        size_str = "none"
+    elif np.allclose(obs_size, obs_size[0, 0]):
         size_str = f"uniform={float(obs_size[0, 0]):.3f}"
     else:
         smin, smax = float(obs_size.min()), float(obs_size.max())
@@ -194,7 +235,7 @@ def main():
 
     print("\n--- INPUT ---")
     print(f"Points file    : {points_path}  ({num_points} pts)")
-    print(f"Obstacles file : {obstacles_path}  ({len(obstacle_xyz)} obstacles, {size_str})")
+    print(f"Obstacles {obs_source_str}  ({len(obstacle_xyz)} obstacles, {size_str})")
     print(f"Num UAVs       : {num_uavs}")
     print(f"Start pts      : {start_points}")
 
