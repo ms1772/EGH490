@@ -53,7 +53,16 @@ managed_params:
   - MPC_TILTMAX_AIR
 
   # --- geofence ------------------------------------------------------------
+  # UNPROVEN INDOORS: GF_MAX_*_DIST is evaluated against GLOBAL position, and
+  # GF_SOURCE defaults to GPOS. With EKF2_GPS_CTRL=0 and no GNSS, EKF2 only
+  # publishes a global position once an EKF origin exists -- so the fence may
+  # never arm at all. Bench-test it (push past GF_MAX_HOR_DIST and confirm a
+  # breach actually fires) before treating it as a real boundary. GF_SOURCE is
+  # in the allow-list so it MAY be changed once that test says what is needed;
+  # its value is deliberately not fixed in px4_indoor_params.yaml yet.
+  # This is also why volume_guard (S2) is the primary fence, not this.
   - GF_ACTION
+  - GF_SOURCE
   - GF_MAX_HOR_DIST
   - GF_MAX_VER_DIST
 
@@ -61,7 +70,10 @@ managed_params:
   # In an 8x6x4 m netted volume the offboard-loss action must be Land.
   # RTL_RETURN_ALT=2 is a manoeuvre in this room, not a return.
   - COM_OBL_RC_ACT
-  - COM_POS_FS_DELAY
+  # COM_POS_FS_DELAY intentionally absent: it does NOT exist in PX4 v1.17.
+  # Removed in v1.16.0 (PX4-Autopilot PR #24063); the position-loss delay is
+  # now fixed at 1 s and is no longer tunable. Listing it here would make
+  # snapshot.py report it missing on every run, forever.
   - COM_DISARM_LAND
   - NAV_DLL_ACT
   - RTL_RETURN_ALT

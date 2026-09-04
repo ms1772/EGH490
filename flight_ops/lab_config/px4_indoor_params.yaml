@@ -1,0 +1,348 @@
+# ===========================================================================
+# px4_indoor_params.yaml -- O-134 indoor flight parameter set
+# ===========================================================================
+#
+# Target:    3x Holybro X500 V2, PX4 v1.17.0, uXRCE-DDS -> Aerostack2
+# Volume:    O-134 netted enclosure, ~8 m x 6 m horizontal, 4 m usable AGL
+# Localisation: OptiTrack mocap ONLY. No GPS indoors. Mocap pose reaches
+#            EKF2 on /fmu/in/vehicle_visual_odometry (external vision).
+#
+# ---------------------------------------------------------------------------
+# HOW THESE ARE APPLIED
+# ---------------------------------------------------------------------------
+# QGroundControl -> Analyze Tools -> MAVLink Console, then per parameter:
+#
+#     param set <NAME> <VALUE>
+#     param show <NAME>          <-- READ BACK. Every single one.
+#     param save
+#     reboot
+#
+# EVERY VALUE MUST BE CONFIRMED BY READ-BACK.
+# The lab QGC install is OLDER than the firmware on the aircraft. Its
+# parameter editor carries stale metadata, so it rejects perfectly valid
+# v1.17 enum values in its dropdowns and throws an error popup EVEN WHEN THE
+# WRITE ACTUALLY SUCCEEDED. The popup is not evidence of anything. The only
+# trustworthy confirmation is `param show` (or a fresh `param save` + reboot
+# + re-read) returning the value you intended. Do not re-issue a write
+# because QGC complained; read back first.
+#
+# Reboot is mandatory before flight: EKF2_EV_DELAY and EKF2_HGT_REF are both
+# reboot_required in the v1.17 metadata.
+#
+# ---------------------------------------------------------------------------
+# SCHEMA
+# ---------------------------------------------------------------------------
+#   value     what to write
+#   type      PX4 wire type (INT32 / FLOAT) -- bitmask and enum are INT32
+#   default   PX4 v1.17.0 factory default, so the delta is visible
+#   range     legal range / enum set as declared in v1.17.0 metadata
+#   why       one line of justification
+#   verified  source file in PX4-Autopilot @ tag v1.17.0 that was read
+#
+# `params` is ordered to match managed_params in expected_state.yaml.
+# Rollback walks that list backwards.
+# ===========================================================================
+
+meta:
+  firmware: PX4 v1.17.0
+  airframe: Holybro X500 V2 (x3)
+  room: O-134 netted volume, 8 m x 6 m x 4 m usable
+  localisation: OptiTrack external vision only (no GNSS)
+  apply_via: QGroundControl -> Analyze Tools -> MAVLink Console (param set / param save / reboot)
+  readback_required: true
+  reboot_required: true
+  verified_against: https://github.com/PX4/PX4-Autopilot/tree/v1.17.0
+  verified_on: 2026-09-04
+
+params:
+
+  # =========================================================================
+  # 1. EXTERNAL VISION AIDING  (mocap into EKF2)
+  # =========================================================================
+  # The EKF2_AID_MASK bitmask was REMOVED in PX4 v1.14 and replaced by the
+  # EKF2_*_CTRL family. It is deliberately absent from this file.
+
+  EKF2_EV_DELAY:
+    value: 50.0
+    type: FLOAT
+    default: 0.0
+    range: 0 to 300 ms
+    why: OptiTrack to ROS 2 to uXRCE-DDS transport lag; QUTAS quote ~50 ms for this room, and an uncompensated EV delay shows up as position oscillation.
+    verified: src/modules/ekf2/params_external_vision.yaml
+    note: >-
+      reboot_required. The QUTAS lab guide states the PX4 default is 175;
+      in v1.17.0 the default is 0. The 50 ms value is still a deliberate,
+      non-default setting -- only the size of the delta changed.
+
+  EKF2_EV_CTRL:
+    value: 15
+    type: INT32
+    default: 0
+    range: bitmask 0 to 15 -- bit0 Horizontal position, bit1 Vertical position, bit2 3D velocity, bit3 Yaw
+    why: All four vision aiding bits on; mocap is the only source of horizontal position, height and heading indoors, so nothing may be left unfused.
+    verified: src/modules/ekf2/params_external_vision.yaml
+
+  EKF2_GPS_CTRL:
+    value: 0
+    type: INT32
+    default: 7
+    range: bitmask 0 to 15 -- bit0 Lon/lat, bit1 Altitude, bit2 3D velocity, bit3 Dual antenna heading
+    why: All GPS aiding bits cleared. A GNSS module indoors produces drifting garbage that would fight the mocap solution; the EKF must not fuse it.
+    verified: src/modules/ekf2/params_gnss.yaml
+
+  EKF2_HGT_REF:
+    value: 3
+    type: INT32
+    default: 1
+    range: enum -- 0 Barometric pressure, 1 GPS, 2 Range sensor, 3 Vision
+    why: Height reference must be Vision, not baro; the barometer drifts metres indoors from door movement and prop wash under a 4 m ceiling.
+    verified: src/modules/ekf2/module.yaml
+    note: >-
+      reboot_required. DISCREPANCY WITH THE LAB GUIDE: the QUTAS guide gives
+      EKF2_HGT_REF = 4 for Vision. In PX4 v1.17.0 the enum only runs 0..3 and
+      Vision is 3. A 4 is out of range. Value 3 used here. Confirm by
+      read-back that `param show EKF2_HGT_REF` returns 3.
+
+  EKF2_EVP_NOISE:
+    value: 0.03
+    type: FLOAT
+    default: 0.1
+    range: min 0.01, unit m
+    why: OptiTrack position residuals in this volume are sub-centimetre, so the default 0.1 m floor needlessly under-weights the only good position source.
+    verified: src/modules/ekf2/params_external_vision.yaml
+    note: >-
+      EKF2_EV_NOISE_MD is left at its default (0), where this value acts as a
+      LOWER BOUND on the covariance carried in the vision message. If the
+      mocap bridge publishes an inflated or zero covariance this parameter
+      will not tighten the fusion -- check the covariance actually being
+      published before blaming the parameter.
+
+  EKF2_EVA_NOISE:
+    value: 0.05
+    type: FLOAT
+    default: 0.1
+    range: min 0.05, unit rad
+    why: Mocap yaw from a rigid body with well-separated markers is good to well under a degree; 0.05 rad (~2.9 deg) is the tightest the metadata allows.
+    verified: src/modules/ekf2/params_external_vision.yaml
+    note: 0.05 is exactly the declared minimum -- do not go lower.
+
+  # =========================================================================
+  # 2. INDOOR ENVELOPE LIMITS
+  # =========================================================================
+  # Sizing logic: the shortest horizontal span is 6 m. A 1.5 m/s cap means a
+  # full-width traverse takes ~4 s, giving the safety pilot real reaction
+  # time, and the stopping distance at the MPC_ACC_HOR default (3 m/s^2) is
+  # ~0.4 m -- comfortably inside the geofence margin below.
+
+  MPC_XY_VEL_MAX:
+    value: 1.5
+    type: FLOAT
+    default: 12.0
+    range: 0 to 20 m/s
+    why: Hard ceiling on horizontal speed in every velocity-controlled mode including Offboard; 1.5 m/s crosses the 6 m span in 4 s and stops in ~0.4 m.
+    verified: src/modules/mc_pos_control/multicopter_position_control_limits_params.c
+    note: This is the parameter that actually bounds Aerostack2 offboard motion. Anything faster is truncated to this value.
+
+  MPC_XY_CRUISE:
+    value: 3.0
+    type: FLOAT
+    default: 5.0
+    range: 3 to 20 m/s
+    why: Autonomous (mission/RTL/goto) cruise speed, set to the lowest value the v1.17 metadata permits; effective indoor speed is still 1.5 m/s because MPC_XY_VEL_MAX truncates it.
+    verified: src/modules/mc_pos_control/multicopter_autonomous_params.c
+    note: >-
+      CONSTRAINT, NOT A CHOICE: MPC_XY_CRUISE declares @min 3 in v1.17.0, so
+      the 1-2 m/s figure wanted for this room is NOT a legal value for this
+      parameter. Do not "fix" this to 1.5 -- the horizontal envelope is
+      enforced by MPC_XY_VEL_MAX, which is legal at 1.5 and clamps cruise.
+
+  MPC_Z_VEL_MAX_UP:
+    value: 1.0
+    type: FLOAT
+    default: 3.0
+    range: 0.5 to 8 m/s
+    why: With only 4 m of net above the floor, 1.0 m/s means the full usable climb takes ~4 s and an uncommanded climb is recoverable before it reaches the ceiling.
+    verified: src/modules/mc_pos_control/multicopter_position_control_limits_params.c
+
+  MPC_Z_VEL_MAX_DN:
+    value: 0.8
+    type: FLOAT
+    default: 1.5
+    range: 0.5 to 4 m/s
+    why: Slower than the climb limit so any failsafe or commanded descent is gentle; 0.8 m/s brings the aircraft down from the 2 m working height in ~2.5 s without a hard touchdown.
+    verified: src/modules/mc_pos_control/multicopter_position_control_limits_params.c
+
+  MPC_TILTMAX_AIR:
+    value: 25.0
+    type: FLOAT
+    default: 45.0
+    range: 20 to 89 deg
+    why: Caps attitude excursion during accel/decel so a controller or estimator glitch becomes a slow lean rather than a dart at the net; 25 deg still leaves ~4.6 m/s^2 of lateral authority, far more than 1.5 m/s needs.
+    verified: src/modules/mc_pos_control/multicopter_position_control_limits_params.c
+    note: 20 deg is the declared minimum; 25 keeps margin above the floor of the range.
+
+  # =========================================================================
+  # 3. GEOFENCE
+  # =========================================================================
+  # Sized INSIDE the net, measured from Home (the takeoff point), which is
+  # set up near the centre of the volume.
+  #
+  #   horizontal: the binding dimension is the 6 m span -> 3.0 m half-width.
+  #               A 2.5 m radius leaves >=0.5 m to the near net and >=1.5 m
+  #               to the far net, and the ~0.4 m stopping distance at
+  #               1.5 m/s fits inside that 0.5 m.
+  #   vertical:   4 m usable, 2 m nominal working height -> a 3.0 m fence
+  #               leaves 1 m of clear air under the ceiling net.
+
+  GF_ACTION:
+    value: 2
+    type: INT32
+    default: 2
+    range: enum 0 to 5 -- 0 None, 1 Warning, 2 Hold mode, 3 Return mode, 4 Terminate, 5 Land mode
+    why: Hold brakes the aircraft to a stop still inside the net and hands a stationary vehicle to the safety pilot -- the minimum-energy response in a volume this small.
+    verified: src/modules/navigator/geofence_params.c
+    note: >-
+      Rejected alternatives: 3 (Return) is a traverse across the room, which
+      is exactly the failure mode this configuration exists to prevent;
+      4 (Terminate) kills the vehicle on breach and is never acceptable over
+      a hard floor at 2 m. 5 (Land mode) is the defensible alternative and
+      should be used instead of 2 if the floor under the flight volume is
+      kept clear of ground equipment on the day.
+
+  GF_MAX_HOR_DIST:
+    value: 2.5
+    type: FLOAT
+    default: 0.0
+    range: 0 to 10000 m (0 disables)
+    why: 2.5 m radius from Home is the largest circle that keeps >=0.5 m of clearance to the 6 m net walls with the takeoff point near room centre.
+    verified: src/modules/navigator/geofence_params.c
+
+  GF_MAX_VER_DIST:
+    value: 3.0
+    type: FLOAT
+    default: 0.0
+    range: 0 to 10000 m (0 disables)
+    why: 3.0 m above Home keeps a full metre of clear air below the 4 m ceiling net while leaving the 2 m nominal working height untouched.
+    verified: src/modules/navigator/geofence_params.c
+
+  # -- GEOFENCE OPERATIONAL CAVEAT ------------------------------------------
+  # GF_MAX_HOR_DIST / GF_MAX_VER_DIST are evaluated against the vehicle's
+  # GLOBAL position (GF_SOURCE defaults to 0 = GPOS). With EKF2_GPS_CTRL = 0
+  # and no GNSS, EKF2 only publishes a global position once an EKF origin has
+  # been set. If no origin is established, this fence may silently never
+  # trigger. GF_SOURCE is NOT in the managed_params allow-list and is not
+  # written here. VERIFY ON THE BENCH, BEFORE THE FIRST FLIGHT, that a
+  # deliberate slow push past 2.5 m actually produces a geofence breach.
+  # Treat the fence as unproven until that test passes.
+
+  # =========================================================================
+  # 4. FAILSAFE BEHAVIOUR
+  # =========================================================================
+  # Governing principle for this room: every failsafe ends on the floor,
+  # under control, where the aircraft already is. In an 8 x 6 m volume an RTL
+  # is a manoeuvre, not a return -- it converts a link problem into a
+  # traverse across occupied airspace.
+
+  COM_OBL_RC_ACT:
+    value: 4
+    type: INT32
+    default: 0
+    range: enum -- 0 Position mode, 1 Altitude mode, 2 Stabilized, 3 Return mode, 4 Land mode, 5 Hold mode, 6 Terminate, 7 Disarm
+    why: Offboard loss must LAND. Aerostack2 is the only thing flying the aircraft, so losing it means descending where it stands -- 3 (Return) would fly the vehicle across the room to Home.
+    verified: src/modules/commander/commander_params.c
+    note: >-
+      4 = "Land mode", taken verbatim from the @value list of COM_OBL_RC_ACT
+      in commander_params.c at tag v1.17.0. THIS IS THE ONE QGC IS MOST
+      LIKELY TO REJECT IN ITS DROPDOWN -- write it in the MAVLink console and
+      confirm with `param show COM_OBL_RC_ACT` returning 4.
+      COM_OBL_ACT (the old no-RC variant) no longer exists in v1.17.
+      The trigger delay is COM_OF_LOSS_T, which is not in the managed
+      allow-list and is left at its factory value.
+
+  COM_DISARM_LAND:
+    value: 2.0
+    type: FLOAT
+    default: 2.0
+    range: seconds; zero or negative disables land-detector auto-disarm
+    why: Pinned rather than changed -- 2 s of auto-disarm after touchdown stops the props promptly, and pinning it stops a previous session leaving it disabled on shared hardware.
+    verified: src/modules/commander/commander_params.c
+    note: Zero delta from default. It is in the allow-list precisely so the snapshot proves it was not left disabled.
+
+  NAV_DLL_ACT:
+    value: 3
+    type: INT32
+    default: 0
+    range: enum 0 to 6 -- 0 Disabled, 1 Hold mode, 2 Return mode, 3 Land mode, 5 Terminate, 6 Disarm
+    why: GCS link loss lands, for the same reason offboard loss lands; the QGC link and the uXRCE-DDS link share the network, so a dropout removes all operator oversight at once.
+    verified: src/modules/commander/commander_params.c
+    note: >-
+      Note there is no value 4 in this enum. The trigger delay is
+      COM_DL_LOSS_T, not in the allow-list and left at its factory value.
+
+  RTL_RETURN_ALT:
+    value: 2.0
+    type: FLOAT
+    default: 60.0
+    range: min 0 m, increment 0.5
+    why: RTL is never a selected failsafe action here, but if a pilot switch or a mode change triggers one the climb must stay inside the net -- 2 m is 2 m below the ceiling.
+    verified: src/modules/navigator/rtl_params.c
+    note: >-
+      Matches the QUTAS lab guide value. Setting this does NOT make RTL an
+      acceptable indoor failsafe; it only makes an accidental RTL survivable.
+
+  RTL_DESCEND_ALT:
+    value: 2.0
+    type: FLOAT
+    default: 30.0
+    range: min 0 m, increment 0.5
+    why: Equal to RTL_RETURN_ALT so an accidental RTL never climbs and never loiters high -- it goes straight into the descent phase from working height.
+    verified: src/modules/navigator/rtl_params.c
+
+# ===========================================================================
+# ALLOW-LIST ENTRIES NOT WRITTEN
+# ===========================================================================
+# Listed in expected_state.yaml managed_params but NOT emitted above.
+# Recorded here deliberately rather than silently dropped.
+
+not_applied:
+
+  COM_POS_FS_DELAY:
+    reason: does_not_exist_in_v1_17
+    detail: >-
+      REMOVED from PX4 in v1.16.0 (PX4-Autopilot PR #24063, "Commander:
+      remove COM_POS_FS_DELAY"). The position-loss failsafe delay is now
+      fixed at 1 s and is no longer configurable. The name is absent from
+      src/modules/commander/commander_params.c at tag v1.17.0, which still
+      defines the neighbouring COM_POS_FS_EPH, COM_POS_LOW_EPH and
+      COM_POS_LOW_ACT.
+    action: >-
+      `param set COM_POS_FS_DELAY` will fail on v1.17. Either remove it from
+      managed_params in expected_state.yaml, or leave it there and accept
+      that snapshot.py reports it missing on every run. Not written here.
+
+# ===========================================================================
+# VERIFICATION RECORD
+# ===========================================================================
+# All 19 parameters written above were checked by name, type, default and
+# legal range against PX4-Autopilot source at tag v1.17.0:
+#   src/modules/ekf2/params_external_vision.yaml
+#   src/modules/ekf2/params_gnss.yaml
+#   src/modules/ekf2/module.yaml
+#   src/modules/mc_pos_control/multicopter_position_control_limits_params.c
+#   src/modules/mc_pos_control/multicopter_autonomous_params.c
+#   src/modules/navigator/geofence_params.c
+#   src/modules/navigator/rtl_params.c
+#   src/modules/commander/commander_params.c
+#
+# COULD NOT VERIFY:
+#   - No parameter was left unverified by name or by range.
+#   - COM_DISARM_LAND: the v1.17 source declares @unit/@decimal/@increment
+#     but no explicit @min/@max, so no numeric range is asserted above. The
+#     value written equals the factory default, so this is not load-bearing.
+#   - Whether the max-distance geofence actually arms without a GNSS-derived
+#     global origin is a RUNTIME question, not a metadata one. It is untested
+#     and must be proven on the bench (see the geofence caveat above).
+#   - The QUTAS lab guide itself was not re-fetched. Two of its quoted values
+#     (EKF2_EV_DELAY default 175, EKF2_HGT_REF 4) do not match v1.17.0
+#     metadata and are corrected above with the source cited.
+# ===========================================================================
