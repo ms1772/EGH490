@@ -26,6 +26,9 @@ gates:
     UXRCE_DDS_PRT: 8888
     UXRCE_DDS_KEY: 1
     UXRCE_DDS_DOM_ID: 0
+    # NOT gated to a single value: UXRCE_DDS_NS_IDX is PER AIRFRAME (see
+    # managed_params below), so a fixed expectation here would fail on two of
+    # the three drones.
 
   baseline_compare:
     - "EKF2_*"
@@ -37,6 +40,21 @@ gates:
 
 # Applied in this order. Rollback walks it backwards.
 managed_params:
+  # --- multi-aircraft topic separation --------------------------------------
+  # PER-AIRFRAME VALUE, and the only one in this list that differs between
+  # drones: 0, 1, 2. PX4 v1.17 defines UXRCE_DDS_NS_IDX as "an index-based
+  # namespace for DDS messages, e.g. uav_0, uav_1", default -1 = no namespace.
+  # Verified in src/modules/uxrce_dds_client/module.yaml at tag v1.17.0.
+  #
+  # Without it all three aircraft publish bare /fmu/... on ROS_DOMAIN_ID 0, so
+  # every platform would fuse all three FCs' odometry and a volume_guard
+  # disarm would reach every aircraft at once. With it, each FC publishes
+  # /uav_N/fmu/..., and as2_platform_pixhawk's fmu_prefix absorbs the naming
+  # difference while the Aerostack2 namespace stays drone0/1/2.
+  #
+  # reboot_required. Range -1..9999.
+  - UXRCE_DDS_NS_IDX
+
   # --- external vision aiding (indoor mocap) -------------------------------
   - EKF2_EV_DELAY            # vision latency compensation
   - EKF2_EV_CTRL             # which vision measurements are fused
