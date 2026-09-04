@@ -1,0 +1,63 @@
+# packages.txt -- the apt package set installed on each Jetson Orin NX.
+#
+# Format, because three scripts parse this file:
+#   * one package name per line
+#   * everything from the first '#' on a line is a comment
+#   * blank lines ignored
+#   * a line beginning '@optional ' names a package that is NICE to have;
+#     jetson_setup.sh installs it if available and verify_jetson.sh reports a
+#     miss as SKIP rather than FAIL.
+#
+# Every entry carries the reason it is here. If you cannot state why a package
+# is on a flight computer, it does not go on the flight computer.
+#
+# Architecture: all of these have ubuntu_jammy_arm64 binaries. The ROS ones
+# were confirmed green on build.ros2.org (see README, "arm64 availability").
+
+# --- bootstrapping the ROS 2 apt source ------------------------------------
+curl                                # fetch the ROS archive key and the .deb URIs
+gnupg                               # dearmor/inspect the ROS archive key
+ca-certificates                     # TLS trust for packages.ros.org
+lsb-release                         # UBUNTU_CODENAME for the sources.list line
+software-properties-common          # add-apt-repository universe (ROS deps live there)
+
+# --- ROS 2 Humble core ------------------------------------------------------
+ros-humble-ros-base                 # ROS 2 core WITHOUT the desktop/GUI stack; the Jetson is headless
+ros-humble-rmw-cyclonedds-cpp       # the project's RMW; RMW_IMPLEMENTATION points at this
+ros-humble-rosidl-default-generators # px4_msgs generates its own interfaces at build time
+
+# --- build toolchain --------------------------------------------------------
+build-essential                     # g++/make for px4_msgs, as2_platform_pixhawk, the XRCE agent
+cmake                               # colcon's CMake backend and the XRCE agent build
+git                                 # provenance checks on the bundled source trees (git apply --check)
+python3-colcon-common-extensions    # `colcon build` itself
+python3-rosdep                      # resolve source-package dependencies to apt names
+python3-pip                         # install the offline aarch64 wheels (pymavlink, fastcrc, pyserial)
+pkg-config                          # XRCE agent's OpenSSL/spdlog discovery
+
+# --- Aerostack2 (arm64 binaries confirmed) ----------------------------------
+ros-humble-aerostack2               # the whole AS2 stack: as2_core, state estimator, controller, behaviors
+ros-humble-mocap4r2-msgs            # mocap4r2_msgs/RigidBodies -- the type vrpn_to_rigidbodies.py publishes
+ros-humble-vrpn-mocap              # per-drone VRPN client (see README: the mocap topology decision)
+
+# --- Micro-XRCE-DDS-Agent build dependencies --------------------------------
+# The agent is NOT in the ROS 2 apt repos on any architecture (verified: the
+# Humble buildfarm has no microxrcedds_agent or micro_ros_agent job). It is
+# built from bundled source with UAGENT_SUPERBUILD=OFF against the Fast-DDS
+# that ROS 2 Humble already ships, so these are the only extra dependencies.
+libspdlog-dev                       # find_package(spdlog 1) -- jammy ships 1.9.2
+libfmt-dev                          # jammy's libspdlog-dev links external fmt
+libssl-dev                          # the agent's security profile links OpenSSL
+libasio-dev                         # asio headers used by the agent's UDP transport
+
+# --- clock and network ------------------------------------------------------
+chrony                              # GS and all three Jetsons must agree on wall time for offboard
+iproute2                            # `ip addr`/`ip route` -- the setup and verify network triage
+iputils-ping                        # reachability of the FC at 10.41.10.2
+net-tools                           # ss/netstat fallback when checking UDP 8888 is free
+
+# --- operating the aircraft at the bench ------------------------------------
+tmux                                # the session launcher pattern used by the ground station
+@optional ros-humble-tf2-tools      # `ros2 run tf2_tools view_frames` when the TF tree is wrong
+@optional ros-humble-rmw-fastrtps-cpp # fallback RMW for isolating a Cyclone-specific fault
+@optional rsync                     # resumable re-delivery of the bundle over a flaky wifi link
