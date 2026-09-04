@@ -173,7 +173,7 @@ The **ground station keeps its own** unnamespaced `vrpn_mocap` +
 > per-namespace mocap topics, run it once per drone for those two checks:
 >
 > ```bash
-> python3 flight_ops/preflight_check.py --only "rigid_bodies pose_delta" \
+> python3 flight_ops/preflight_check.py --only rigid_bodies,pose_delta \
 >     --drones drone0 --mocap-topic /drone0/mocap/rigid_bodies
 > ```
 >
@@ -343,7 +343,7 @@ compiled on an Orin NX). Run it under `tmux` so an ssh drop does not kill it.
 | 5 agent | `OK MicroXRCEAgent built and runs` |
 | 6 env | `OK wrote …/setup_env.sh`, `OK wrote …/cyclonedds.xml` |
 
-Any phase can be re-run alone: `--only "build"`, `--only "agent env"`. A phase
+Any phase can be re-run alone: `--only build`, `--only agent,env`. A phase
 that is already satisfied says so and does nothing.
 
 **Rollback:** `~/as2_o134_ws/.deploy/rollback.sh` (dry run) then `--apply`.

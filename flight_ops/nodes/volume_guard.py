@@ -75,6 +75,12 @@ Usage:
     python3 volume_guard.py --drones drone0,drone1,drone2 --arm \\
         --fmu-prefix '/{ns}' --box 8 6 4 --box-center 0 0 2 --margin 0.5
 
+    # PX4's UXRCE_DDS_NS_IDX namespaces the FMU topics /uav_0, /uav_1,
+    # /uav_2 while Aerostack2 namespaces the drones drone0, drone1,
+    # drone2. No template spans both, so the mapping is stated, not derived
+    python3 volume_guard.py --drones drone0,drone1,drone2 --arm \\
+        --fmu-prefix-map drone0=/uav_0,drone1=/uav_1,drone2=/uav_2
+
     # Motive streams numeric rigid-body ids: map namespace -> body
     python3 volume_guard.py --rigid-bodies drone0:1,drone1:2,drone2:3
 
@@ -1103,6 +1109,45 @@ def parse_target_systems(spec: Optional[str], drones: Sequence[str]) -> Dict[str
     return mapping
 
 
+def parse_fmu_prefix_map(spec: Optional[str], drones: Sequence[str]) -> Dict[str, str]:
+    """Map drone namespace -> FMU topic prefix, e.g. 'drone0=/uav_0,drone1=/uav_1'.
+
+    Aerostack2 calls the aircraft `drone0`; PX4's UXRCE_DDS_NS_IDX calls the
+    SAME aircraft's FMU topics `/uav_0`. Nothing derives one name from the
+    other, so no form of --fmu-prefix can express it: a bare prefix aims three
+    drones at one topic, and '/{ns}' aims them at topics that do not exist --
+    which the guard would then watch, and report as a permanent pose_timeout.
+    A static ROS remap can redirect the publisher, but then this node's log
+    lines and /volume_guard/status still name the PRE-REMAP topic: a safety
+    node telling the operator it publishes somewhere it does not.
+
+    Only the drones named here are overridden; a drone with no entry falls back
+    to --fmu-prefix. A drone named here that is NOT being watched is an error,
+    because it means the crew believes a mapping is in force that is not.
+    """
+    if not spec or not str(spec).strip():
+        return {}
+    entries = [e.strip() for e in str(spec).split(",") if e.strip()]
+    mapping: Dict[str, str] = {}
+    known = set(str(d) for d in drones)
+    for entry in entries:
+        ns, sep, raw = entry.partition("=")
+        ns = ns.strip()
+        if not sep or not ns:
+            raise ValueError(f"--fmu-prefix-map: '{entry}' is not an "
+                             "'ns=prefix' pair")
+        if ns not in known:
+            raise ValueError(f"--fmu-prefix-map names unknown drone '{ns}'")
+        if ns in mapping:
+            raise ValueError(f"--fmu-prefix-map names '{ns}' twice")
+        prefix = raw.strip()
+        if not prefix:
+            raise ValueError(f"--fmu-prefix-map: '{ns}' has an empty prefix; "
+                             "omit the entry to fall back to --fmu-prefix")
+        mapping[ns] = prefix
+    return mapping
+
+
 def parse_policy_spec(text: str, policies: Dict[str, ConditionPolicy]
                       ) -> Dict[str, ConditionPolicy]:
     """`NAME:LADDER[:CONFIRM[:ESCALATE]]` -> the policies it changes.
@@ -1176,38 +1221,68 @@ def _as_float(text: str, label: str) -> float:
     return value
 
 
-def resolve_fmu_topic(prefix: str, namespace: str) -> str:
+def resolve_fmu_topic(prefix: str, namespace: str,
+                      overrides: Optional[Dict[str, str]] = None) -> str:
     """`--fmu-prefix` follows preflight_check.py exactly: a bare prefix is
-    prepended, and a prefix containing '{ns}' is resolved per drone."""
+    prepended, and a prefix containing '{ns}' is resolved per drone.
+
+    `overrides` is --fmu-prefix-map. An entry for this namespace wins over both
+    and is used VERBATIM -- no '{ns}' substitution -- because the whole point of
+    the map is the case where no template relates the Aerostack2 namespace to
+    the PX4 one. With no entry for this drone the behaviour is unchanged, so
+    every caller that passes no overrides keeps exactly the semantics it had.
+    """
+    if overrides is not None and namespace in overrides:
+        return str(overrides[namespace]) + FMU_VEHICLE_COMMAND_TOPIC
     prefix = str(prefix or "")
     base = prefix.format(ns=namespace) if "{ns}" in prefix else prefix
     return base + FMU_VEHICLE_COMMAND_TOPIC
 
 
 def check_disarm_routing(drones: Sequence[str], fmu_prefix: str,
-                         target_systems: Dict[str, int]) -> Optional[str]:
+                         target_systems: Dict[str, int],
+                         fmu_prefix_map: Optional[Dict[str, str]] = None
+                         ) -> Optional[str]:
     """Refuse a configuration in which a disarm cannot be aimed.
 
-    "One drone tripping must not act on another" is the requirement. With more
-    than one aircraft sharing a single `/fmu/in/vehicle_command` topic, the only
-    thing separating them is `target_system` -- so if those collide, a geofence
-    trip on drone0 drops drone1 out of the air. That is a configuration error
-    worth refusing to start over.
+    "One drone tripping must not act on another" is the requirement. A
+    VehicleCommand can only reach an aircraft it was not meant for when TWO
+    things are true at once: that aircraft listens on the same
+    `/fmu/in/vehicle_command` topic, AND it answers to the same
+    `target_system`, because PX4 drops a command addressed to another system
+    id. So the drones are grouped by the topic each one RESOLVES to -- which is
+    exactly what --fmu-prefix-map changes -- and a group is refused only when
+    two of its members also share an id.
+
+    Distinct topics therefore end the question: a drone on its own /uav_N
+    namespace cannot be hit by another drone's disarm whatever its id, which is
+    what the old '{ns}' special case was a narrower way of saying. A shared
+    topic with colliding ids is still refused, because there a geofence trip on
+    drone0 drops drone1 out of the air.
     """
     if len(drones) < 2:
         return None
-    if "{ns}" in str(fmu_prefix or ""):
-        return None
-    ids = [target_systems.get(ns, DEFAULT_TARGET_SYSTEM) for ns in drones]
-    if len(set(ids)) == len(ids):
-        return None
-    shared = resolve_fmu_topic(fmu_prefix, drones[0])
-    return (f"{len(drones)} drones share the single topic {shared} and do not "
-            f"have distinct target_system ids ({', '.join(str(i) for i in ids)}). "
-            "A disarm would reach every aircraft on that link. Give each drone "
-            "its own FMU namespace (--fmu-prefix '/{ns}') or distinct ids "
-            "(--target-systems drone0:1,drone1:2,...). Override only with "
-            "--allow-ambiguous-disarm, and only if you know the link is shared.")
+    routes: Dict[str, List[str]] = {}
+    for ns in drones:
+        routes.setdefault(
+            resolve_fmu_topic(fmu_prefix, ns, fmu_prefix_map), []).append(ns)
+    for topic, sharing in routes.items():
+        if len(sharing) < 2:
+            continue
+        ids = [target_systems.get(ns, DEFAULT_TARGET_SYSTEM) for ns in sharing]
+        if len(set(ids)) == len(ids):
+            continue
+        listed = ", ".join(f"{ns} sys {i}" for ns, i in zip(sharing, ids))
+        return (f"{len(sharing)} drones share the single topic {topic} and do "
+                f"not have distinct target_system ids ({listed}). "
+                "A disarm would reach every aircraft on that link. Give each "
+                "drone its own FMU namespace (--fmu-prefix '/{ns}', or "
+                "--fmu-prefix-map drone0=/uav_0,drone1=/uav_1 when PX4's "
+                "UXRCE_DDS_NS_IDX does not match the Aerostack2 namespaces), "
+                "or distinct ids (--target-systems drone0:1,drone1:2,...). "
+                "Override only with --allow-ambiguous-disarm, and only if you "
+                "know the link is shared.")
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -1246,6 +1321,7 @@ def main_ros(cli: argparse.Namespace, argv: Optional[List[str]] = None) -> int:
             self.declare_parameter("land_action_template",
                                    DEFAULT_LAND_ACTION_TEMPLATE)
             self.declare_parameter("fmu_prefix", "")
+            self.declare_parameter("fmu_prefix_map", "")
             self.declare_parameter("box_size_m", list(DEFAULT_BOX_M))
             self.declare_parameter("box_center_m", list(DEFAULT_BOX_CENTER_M))
             self.declare_parameter("fence_margin_m", DEFAULT_FENCE_MARGIN_M)
@@ -1329,6 +1405,9 @@ def main_ros(cli: argparse.Namespace, argv: Optional[List[str]] = None) -> int:
                         self.get_parameter("startup_grace_s").value)))
                 self.fmu_prefix = str(_pick(
                     cli.fmu_prefix, self.get_parameter("fmu_prefix").value))
+                self.fmu_prefix_map = parse_fmu_prefix_map(
+                    _pick(cli.fmu_prefix_map,
+                          self.get_parameter("fmu_prefix_map").value), drones)
                 rate = float(_pick(cli.rate, self.get_parameter("rate_hz").value))
                 status_rate = float(_pick(
                     cli.status_rate, self.get_parameter("status_rate_hz").value))
@@ -1338,8 +1417,9 @@ def main_ros(cli: argparse.Namespace, argv: Optional[List[str]] = None) -> int:
                     cli.land_speed, self.get_parameter("land_speed_mps").value))
                 repeat = int(_pick(cli.disarm_repeat,
                                    self.get_parameter("disarm_repeat").value))
-                routing_problem = check_disarm_routing(drones, self.fmu_prefix,
-                                                       self.target_systems)
+                routing_problem = check_disarm_routing(
+                    drones, self.fmu_prefix, self.target_systems,
+                    self.fmu_prefix_map)
                 # Refused only when the actions are real. A dry run sends
                 # nothing, so an ambiguous route is a warning there -- but it is
                 # a warning the crew must see at the bench rather than discover
@@ -1391,7 +1471,10 @@ def main_ros(cli: argparse.Namespace, argv: Optional[List[str]] = None) -> int:
             # /fmu/in/*; it is also why a disarm is re-sent rather than trusted.
             self.command_pubs = {}
             for ns in drones:
-                topic = resolve_fmu_topic(self.fmu_prefix, ns)
+                # Through the same accessor the log lines and the status
+                # payload use, so what is reported cannot drift from what is
+                # bound.
+                topic = self.command_topic(ns)
                 self.command_pubs[ns] = self.create_publisher(
                     VehicleCommand, topic, sensor_qos)
 
@@ -1422,7 +1505,7 @@ def main_ros(cli: argparse.Namespace, argv: Optional[List[str]] = None) -> int:
                 f"watching {len(drones)} drone(s): "
                 + ", ".join(f"{ns}->body '{self.rigid_bodies[ns]}' "
                             f"sys {self.target_systems[ns]} "
-                            f"cmd {resolve_fmu_topic(self.fmu_prefix, ns)}"
+                            f"cmd {self.command_topic(ns)}"
                             for ns in drones))
             self.get_logger().info(
                 f"fence +/-{half[0]:.2f}, {half[1]:.2f}, {half[2]:.2f} m about "
@@ -1451,6 +1534,15 @@ def main_ros(cli: argparse.Namespace, argv: Optional[List[str]] = None) -> int:
 
         def now_s(self) -> float:
             return self.get_clock().now().nanoseconds * 1e-9
+
+        def command_topic(self, ns: str) -> str:
+            """The topic this drone's disarm is ACTUALLY published on.
+
+            Every log line, the dry-run message and the status payload go
+            through here, so the operator can never be told one topic while
+            the publisher is bound to another.
+            """
+            return resolve_fmu_topic(self.fmu_prefix, ns, self.fmu_prefix_map)
 
         def on_mocap(self, msg) -> None:
             # Arrival time on OUR clock. The header stamp is not read at all:
@@ -1534,7 +1626,7 @@ def main_ros(cli: argparse.Namespace, argv: Optional[List[str]] = None) -> int:
                 timestamp_us=int(self.get_clock().now().nanoseconds // 1000))
             if self.dry_run:
                 self.get_logger().error(
-                    f"[DRY RUN] {resolve_fmu_topic(self.fmu_prefix, action.drone)} "
+                    f"[DRY RUN] {self.command_topic(action.drone)} "
                     f"command={cmd.command} param1={cmd.param1} "
                     f"param2={cmd.param2} target_system={cmd.target_system}")
                 return
@@ -1588,6 +1680,11 @@ def main_ros(cli: argparse.Namespace, argv: Optional[List[str]] = None) -> int:
             payload = self.core.status(self.now_s())
             payload["dry_run"] = self.dry_run
             payload["fmu_prefix"] = self.fmu_prefix
+            payload["fmu_prefix_map"] = dict(self.fmu_prefix_map)
+            # The RESOLVED topics, not just the prefix they were built
+            # from: this is the same string the publisher was created with.
+            payload["fmu_command_topics"] = {
+                ns: self.command_topic(ns) for ns in self.core.drones}
             payload["target_systems"] = dict(self.target_systems)
             self.status_pub.publish(String(data=json.dumps(payload)))
 
@@ -1647,6 +1744,10 @@ def print_conditions() -> None:
           f"(VEHICLE_CMD_COMPONENT_ARM_DISARM), "
           f"param1={PX4_ARMING_ACTION_DISARM:g} (ARMING_ACTION_DISARM), "
           f"param2={PX4_FORCE_DISARM_MAGIC:g} (PX4 force magic).")
+    print(f"          Published on {FMU_VEHICLE_COMMAND_TOPIC}, namespaced by")
+    print("          --fmu-prefix, or per drone by --fmu-prefix-map")
+    print("          (drone0=/uav_0,drone1=/uav_1) when PX4's UXRCE_DDS_NS_IDX")
+    print("          does not match the Aerostack2 namespaces.")
     print("          THE AIRCRAFT FALLS. Actions are DRY RUN unless --arm.")
     print()
     print("Everything latches. Clear with:")
@@ -2068,6 +2169,48 @@ def self_test() -> int:  # noqa: C901 -- a flat list of cases reads better here
           and resolve_fmu_topic("/{ns}", "drone1")
           == "/drone1/fmu/in/vehicle_command"
           and resolve_fmu_topic("/uav", "drone0") == "/uav/fmu/in/vehicle_command")
+    check("no prefix map resolves exactly as it did before",
+          resolve_fmu_topic("/{ns}", "drone1", None)
+          == resolve_fmu_topic("/{ns}", "drone1")
+          and resolve_fmu_topic("/{ns}", "drone1", {})
+          == "/drone1/fmu/in/vehicle_command")
+    check("a mapped drone takes its prefix VERBATIM",
+          resolve_fmu_topic("", "drone0", {"drone0": "/uav_0"})
+          == "/uav_0/fmu/in/vehicle_command")
+    check("the map beats --fmu-prefix, template included",
+          resolve_fmu_topic("/{ns}", "drone0", {"drone0": "/uav_0"})
+          == "/uav_0/fmu/in/vehicle_command")
+    check("an unmapped drone falls back to --fmu-prefix",
+          resolve_fmu_topic("/{ns}", "drone1", {"drone0": "/uav_0"})
+          == "/drone1/fmu/in/vehicle_command"
+          and resolve_fmu_topic("", "drone1", {"drone0": "/uav_0"})
+          == "/fmu/in/vehicle_command")
+
+    px4_ns = {"drone0": "/uav_0", "drone1": "/uav_1", "drone2": "/uav_2"}
+    check("a prefix map giving every drone its own topic is unambiguous",
+          check_disarm_routing(["drone0", "drone1", "drone2"], "",
+                               {"drone0": 1, "drone1": 1, "drone2": 1},
+                               px4_ns) is None)
+    check("a partial map still separates the mapped drone from the rest",
+          check_disarm_routing(["drone0", "drone1"], "",
+                               {"drone0": 1, "drone1": 1},
+                               {"drone0": "/uav_0"}) is None)
+    check("a map aiming two drones at ONE topic with colliding ids is REFUSED",
+          check_disarm_routing(["drone0", "drone1"], "",
+                               {"drone0": 1, "drone1": 1},
+                               {"drone0": "/uav_0", "drone1": "/uav_0"})
+          is not None)
+    check("the same shared topic with distinct ids is still allowed",
+          check_disarm_routing(["drone0", "drone1"], "",
+                               {"drone0": 1, "drone1": 2},
+                               {"drone0": "/uav_0", "drone1": "/uav_0"}) is None)
+    check("an empty map changes nothing, so the bare shared link is REFUSED",
+          check_disarm_routing(["drone0", "drone1"], "",
+                               {"drone0": 1, "drone1": 1}, {}) is not None)
+    check("the refusal names the topic that is actually shared",
+          "/uav_0/fmu/in/vehicle_command" in (check_disarm_routing(
+              ["drone0", "drone1"], "", {"drone0": 1, "drone1": 1},
+              {"drone0": "/uav_0", "drone1": "/uav_0"}) or ""))
 
     print("configuration parsing")
     check("drones split on commas",
@@ -2109,6 +2252,23 @@ def self_test() -> int:  # noqa: C901 -- a flat list of cases reads better here
             check(f"rejects --target-systems '{bad}'", False)
         except ValueError:
             check(f"rejects --target-systems '{bad}'", True)
+    check("no FMU prefix map means no override at all, not a default",
+          parse_fmu_prefix_map(None, ["drone0"]) == {}
+          and parse_fmu_prefix_map("   ", ["drone0"]) == {})
+    check("the FMU prefix map reads 'ns=prefix' pairs",
+          parse_fmu_prefix_map("drone0=/uav_0, drone1=/uav_1",
+                               ["drone0", "drone1", "drone2"])
+          == {"drone0": "/uav_0", "drone1": "/uav_1"})
+    check("a drone with no entry is simply absent, and falls back",
+          "drone2" not in parse_fmu_prefix_map(
+              "drone0=/uav_0", ["drone0", "drone1", "drone2"]))
+    for bad in ("drone0", "drone0:/uav_0", "drone9=/uav_9", "drone0=",
+                "=/uav_0", "drone0=/uav_0,drone0=/uav_1"):
+        try:
+            parse_fmu_prefix_map(bad, ["drone0", "drone1"])
+            check(f"rejects --fmu-prefix-map '{bad}'", False)
+        except ValueError:
+            check(f"rejects --fmu-prefix-map '{bad}'", True)
 
     print("policy specification")
     policies = apply_policy_specs(["geofence:land+disarm:0.1:0.5"])
@@ -2266,6 +2426,15 @@ def build_parser() -> argparse.ArgumentParser:
     plumbing.add_argument("--fmu-prefix", default=None,
                           help="prefix for /fmu/ topics; include '{ns}' for a "
                                "per-drone namespace (default: bare /fmu/...)")
+    plumbing.add_argument("--fmu-prefix-map", default=None,
+                          metavar="NS=PREFIX,...",
+                          help="explicit per-drone FMU prefix, e.g. "
+                               "'drone0=/uav_0,drone1=/uav_1'. Each prefix is "
+                               "used VERBATIM and beats --fmu-prefix; a drone "
+                               "with no entry falls back to it. This is the "
+                               "PX4 UXRCE_DDS_NS_IDX case, where the FMU "
+                               "topics are /uav_0.. and no template relates "
+                               "them to the Aerostack2 namespaces.")
     plumbing.add_argument("--target-systems", default=None,
                           help="'ns:id,...' or positional ids; PX4 "
                                f"target_system per drone (default all "
@@ -2310,12 +2479,14 @@ def main() -> int:
         drones = parse_drones(cli.drones or ",".join(DEFAULT_DRONES))
         parse_rigid_bodies(cli.rigid_bodies, drones)
         targets = parse_target_systems(cli.target_systems, drones)
+        prefix_map = parse_fmu_prefix_map(cli.fmu_prefix_map, drones)
         if cli.box is not None or cli.box_center is not None or cli.margin is not None:
             Box(size=tuple(cli.box or DEFAULT_BOX_M),
                 center=tuple(cli.box_center or DEFAULT_BOX_CENTER_M),
                 margin=DEFAULT_FENCE_MARGIN_M if cli.margin is None else cli.margin)
         if cli.arm:
-            problem = check_disarm_routing(drones, cli.fmu_prefix or "", targets)
+            problem = check_disarm_routing(drones, cli.fmu_prefix or "",
+                                           targets, prefix_map)
             if problem and not cli.allow_ambiguous_disarm:
                 raise ValueError(problem)
     except ValueError as exc:
