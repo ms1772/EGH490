@@ -23,13 +23,14 @@ executed.
 | Path | What it is |
 |---|---|
 | `snapshot.py` | Gate G0. Read-only capture of shared lab state + rollback generation. |
-| `preflight_check.py` | S4. One PASS/FAIL table; gates props-on. *(not yet built)* |
+| `preflight_check.py` | S4. Nine checks, one PASS/FAIL table; gates props-on. `--self-test` runs 139 assertions without ROS. |
 | `session_bringup.sh` | S7. The single tmux launcher, identical off-site and in the lab. *(not yet built)* |
-| `nodes/vrpn_to_rigidbodies.py` | S6. VRPN `PoseStamped` -> `mocap4r2_msgs/RigidBodies`. *(not yet built)* |
+| `nodes/vrpn_to_rigidbodies.py` | S6. VRPN `PoseStamped` -> `mocap4r2_msgs/RigidBodies`, freshness-gated. |
 | `nodes/volume_guard.py` | S2. Safety-critical watchdog. *(not yet built)* |
-| `nodes/fake_mocap.py` | Synthetic mocap with fault injection, for rig R1. *(not yet built)* |
+| `nodes/fake_mocap.py` | Synthetic mocap with eight injectable faults, for rig R1. |
 | `lab_config/expected_state.yaml` | Refuse-to-proceed gates + the managed-parameter allow-list. |
-| `lab_config/px4_indoor_params.yaml` | S5. Indoor failsafe/envelope values. *(not yet built)* |
+| `lab_config/px4_indoor_params.yaml` | S5. Indoor envelope, geofence and failsafe values, verified against PX4 v1.17.0 source. |
+| `patches/` | Vendored fixes to `as2_platform_pixhawk`, with evidence. |
 | `lab_config/o134_project/` | The Aerostack2 hardware project. *(not yet built)* |
 | `snapshots/<UTC>/` | Timestamped state captures and their generated rollbacks. |
 | `runsheets/` | The carried-on-a-clipboard procedures. |
