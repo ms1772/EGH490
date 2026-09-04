@@ -1,0 +1,93 @@
+# ===========================================================================
+# motion_behaviors.yaml -- takeoff / land / go_to / follow_path, SHARED
+# ===========================================================================
+#
+# Passed as:
+#   ros2 launch as2_behaviors_motion motion_behaviors_launch.py \
+#       namespace:=droneN config_file:=<this file> use_sim_time:=false
+#
+# One file feeds all four behaviour nodes: motion_behaviors_launch.py's
+# override_behavior_default_config_file() copies the `config_file` argument
+# into every <behavior>_config_file. The node-scoped shape below is the same
+# one the Aerostack2 Gazebo reference project uses.
+#
+# The four *_plugin_name keys are NOT optional. If none is found -- here or
+# on the command line -- override_plugin_name_in_context() raises
+# "No plugin_name provided or not found in config_file" and the launch dies.
+#
+# WHY THESE PLUGINS
+#
+#   takeoff_plugin_position   climbs to a POSITION setpoint and stops there.
+#                             The speed variant keeps climbing until a
+#                             threshold says stop, which under a 4 m ceiling
+#                             net is the wrong failure direction.
+#   land_plugin_speed         commands a descent rate and finishes on the
+#                             land detector. The position variant needs a
+#                             floor height it does not have indoors.
+#   go_to_plugin_position     position reference, converted to a SPEED
+#                             setpoint by pid_speed_controller, which is the
+#                             only mode the Pixhawk platform advertises.
+#   follow_path_plugin_position  same, for the DECK-GA waypoint lists that
+#                             deckga_execute.py feeds it.
+#
+# The *_plugin_trajectory variants all route through the polynomial
+# trajectory generator and are deliberately not selected: an indoor path is
+# 2-3 m long and the smoothing horizon is a liability, not a feature.
+#
+# SPEEDS
+#
+# Every speed here is 0.5 m/s, which is also the upstream default. It sits
+# under every limit downstream of it, with margin, in
+# lab_config/px4_indoor_params.yaml:
+#
+#   MPC_XY_VEL_MAX    1.5 m/s   (horizontal, PX4 hard clamp)
+#   MPC_Z_VEL_MAX_UP  1.0 m/s   (climb)
+#   MPC_Z_VEL_MAX_DN  0.8 m/s   (descent)
+#   volume_guard --max-speed 2.0 m/s (watchdog trip)
+#
+# 0.5 m/s crosses the 6 m span in 12 s, which is the point: the safety pilot
+# gets time to see it going wrong. Raise these only after the envelope has
+# been flown at 0.5.
+# ===========================================================================
+
+/**:
+
+  TakeoffBehavior:
+    ros__parameters:
+      takeoff_plugin_name: "takeoff_plugin_position"
+      # 1.0 m working height. The vertical geofence is 3.0 m above home and
+      # the net is at 4 m, so this leaves the whole upper half of the volume
+      # unused on the first flights, on purpose.
+      takeoff_height: 1.0
+      takeoff_speed: 0.5
+      takeoff_threshold: 0.2
+      tf_timeout_threshold: 0.05
+
+  LandBehavior:
+    ros__parameters:
+      land_plugin_name: "land_plugin_speed"
+      land_speed: 0.5
+      land_speed_condition_percentage: 0.2
+      land_speed_condition_height: 0.2
+      # Only read by land_plugin_trajectory, which is not selected. Left at
+      # the upstream value rather than deleted, so switching the plugin does
+      # not land on a zero.
+      land_trajectory_height: -10.0
+      tf_timeout_threshold: 0.05
+
+  GoToBehavior:
+    ros__parameters:
+      go_to_plugin_name: "go_to_plugin_position"
+      go_to_speed: 0.5
+      # 0.2 m arrival tolerance. Tight enough to be a waypoint in an 8 x 6 m
+      # room, loose enough that ~2 mm of mocap noise and a 40 ms velocity
+      # filter cannot make the behaviour hunt.
+      go_to_threshold: 0.2
+      tf_timeout_threshold: 0.05
+
+  FollowPathBehavior:
+    ros__parameters:
+      follow_path_plugin_name: "follow_path_plugin_position"
+      follow_path_speed: 0.5
+      follow_path_threshold: 0.2
+      tf_timeout_threshold: 0.05

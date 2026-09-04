@@ -1,0 +1,64 @@
+# ===========================================================================
+# platform_sim.yaml -- as2_platform_multirotor_simulator, rig R1 ONLY
+# ===========================================================================
+#
+# Passed as:
+#   ros2 launch as2_platform_multirotor_simulator \
+#       as2_platform_multirotor_simulator.launch.py \
+#       namespace:=droneN config_file:=<this file> use_sim_time:=false
+#
+# This is the ONLY file in this project that exists for simulation, and it
+# replaces exactly one component: the platform. Everything downstream of it
+# -- state estimator, controller, behaviors, volume guard -- is launched from
+# the same shared configuration in both modes, which is the entire point of
+# the rig. If a value only works in `--sim`, it is in the wrong file.
+#
+# WHAT THE R1 RIG DOES AND DOES NOT PROVE
+#
+#   Proves: every node comes up, the plugin loads, the TF chain
+#           earth -> map -> odom -> base_link resolves, self_localization
+#           tracks the mocap source, the behaviors and the volume guard find
+#           their topics and actions, and the launcher's own arithmetic
+#           (namespaces, prefixes, remaps) is right.
+#
+#   Does NOT prove: closed-loop flight. The simulator integrates its own
+#           dynamics while the state estimator is fed by fake_mocap.py, so
+#           the two are independent. That is deliberate -- the object under
+#           test is the mocap -> estimator -> platform chain, not a flight
+#           model. Do not read a stable hover out of this rig; there is no
+#           loop closed around it.
+#
+# `use_sim_time` is false here as it is everywhere in this project. The
+# multirotor simulator runs on wall time by default and nothing in the stack
+# publishes /clock, so a true here would stall every node's timers.
+# ===========================================================================
+
+/**:
+  ros__parameters:
+
+    simulation:
+      update_freq: 1000.0
+      control_freq: 100.0
+      inertial_odometry_freq: 1000.0
+
+    # Ground truth rather than the simulator's own inertial odometry, so that
+    # any disagreement seen downstream is the fault of the chain under test
+    # and not of a second estimator nobody asked for.
+    use_odom_for_control: false
+
+    # Matched to config/platform_pixhawk.yaml so the rig exercises the same
+    # command cadence the aircraft will.
+    cmd_freq: 100.0
+    info_freq: 10.0
+
+    # Frame names, identical to the hardware platform and to the state
+    # estimator. as2 namespaces all but global_ref_frame into
+    # "<namespace>/<frame>".
+    global_ref_frame: "earth"
+    odom_frame: "odom"
+    base_frame: "base_link"
+
+    imu_pub_freq: 100.0
+    odometry_pub_freq: 100.0
+    ground_truth_pub_freq: 60.0
+    gps_pub_freq: 30.0

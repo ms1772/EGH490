@@ -1,0 +1,146 @@
+# ===========================================================================
+# pid_speed_controller.yaml -- controller GAINS, SHARED by all aircraft
+# ===========================================================================
+#
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# EVERY NUMBER IN THIS FILE IS MUST-BE-DETERMINED. See README.md, MBD-4.
+#
+# These gains are carried VERBATIM from the Aerostack2 reference project
+# aerostack_examples/02_examples_gazebo_project/project_gazebo/config/
+# pid_speed_controller.yaml -- i.e. from a Gazebo quadrotor with perfect
+# state, not from a Holybro X500 V2 flying on 100 Hz motion capture with a
+# 40 ms velocity filter in the loop. They have never been flown on this
+# airframe.
+#
+# WHY NOT LEAVE THEM AT THE INSTALLED DEFAULTS
+#
+# Because the installed default
+# (/opt/ros/humble/share/as2_motion_controller/plugins/pid_speed_controller/
+#  config/controller_default.yaml) has EVERY GAIN AT 0.0. A zero-gain PID is
+# a controller that comes up green, reports healthy, accepts a go_to goal,
+# and commands zero speed forever. That failure is indistinguishable from a
+# planning problem for the first twenty minutes of a lab session.
+#
+# So: a known, documented, upstream starting point with its provenance
+# attached, rather than either an invented number or a silent no-op.
+#
+# HOW TO CLOSE THIS OUT
+#
+# Tune on the tether, one axis at a time, against the indoor envelope in
+# lab_config/px4_indoor_params.yaml (MPC_XY_VEL_MAX 1.5 m/s,
+# MPC_Z_VEL_MAX_UP 1.0 m/s, MPC_Z_VEL_MAX_DN 0.8 m/s, MPC_TILTMAX_AIR 25
+# deg). Record the flown values and replace this file wholesale.
+#
+# A SIZING NOTE THAT MATTERS BEFORE THE FIRST HOVER
+#
+# position_control.kp = 1.0 means "command 1 m/s of speed per metre of
+# position error". volume_guard.py trips `overspeed` at 2.0 m/s. A go_to
+# issued from more than 2 m away therefore asks for a speed the safety
+# watchdog is configured to treat as a fault -- PX4 clamps it to
+# MPC_XY_VEL_MAX = 1.5 m/s first, and the behaviors clamp it to their own
+# 0.5 m/s before that, so in practice it does not fire. Two clamps deep is
+# not a margin anyone should rely on. Confirm the actual commanded speed on
+# the tether before trusting it, or lower kp.
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+/**:
+  ros__parameters:
+
+    # Scale a saturated command down proportionally on all axes instead of
+    # clipping each axis independently, so the commanded DIRECTION survives
+    # saturation. In a netted room, a direction error under saturation is a
+    # net strike.
+    proportional_limitation: true
+
+    # -- position -> speed -------------------------------------------------
+    # Used by go_to_plugin_position, takeoff_plugin_position and
+    # follow_path_plugin_position, which are what config/motion_behaviors.yaml
+    # selects and what deckga_execute.py drives.
+    position_control:
+      reset_integral: false
+      antiwindup_cte: 0.5
+      alpha: 0.2
+      kp:
+        x: 1.0
+        y: 1.0
+        z: 1.0
+      kd:
+        x: 0.0
+        y: 0.0
+        z: 0.0
+      ki:
+        x: 0.01
+        y: 0.01
+        z: 0.01
+
+    # -- speed passthrough -------------------------------------------------
+    # All zero upstream and left so: a SPEED reference is already in the mode
+    # the platform accepts, so it is passed through (use_bypass) rather than
+    # regulated.
+    speed_control:
+      reset_integral: false
+      antiwindup_cte: 1.0
+      alpha: 0.3
+      kp:
+        x: 0.0
+        y: 0.0
+        z: 0.0
+      kd:
+        x: 0.0
+        y: 0.0
+        z: 0.0
+      ki:
+        x: 0.0
+        y: 0.0
+        z: 0.0
+
+    # -- speed in a plane (horizontal speed, held height) ------------------
+    speed_in_a_plane_control:
+      reset_integral: false
+      antiwindup_cte: 1.0
+      alpha: 0.3
+      height:
+        kp: 1.0
+        kd: 0.0
+        ki: 0.01
+      speed:
+        kp:
+          x: 0.0
+          y: 0.0
+        kd:
+          x: 0.0
+          y: 0.0
+        ki:
+          x: 0.0
+          y: 0.0
+
+    # -- trajectory --------------------------------------------------------
+    # Used when a behavior is switched to its *_plugin_trajectory variant.
+    # motion_behaviors.yaml does not select any of those, so this block is
+    # inert as configured. It is kept, at the reference values, so that
+    # switching a behavior does not silently land on zero gains.
+    trajectory_control:
+      reset_integral: false
+      antiwindup_cte: 1.0
+      alpha: 0.3
+      kp:
+        x: 0.4
+        y: 0.4
+        z: 0.4
+      kd:
+        x: 0.0001
+        y: 0.0001
+        z: 0.0001
+      ki:
+        x: 0.0
+        y: 0.0
+        z: 0.0
+
+    # -- yaw ---------------------------------------------------------------
+    yaw_control:
+      reset_integral: false
+      antiwindup_cte: 1.0
+      alpha: 0.3
+      kp: 1.0
+      kd: 0.001
+      ki: 0.0

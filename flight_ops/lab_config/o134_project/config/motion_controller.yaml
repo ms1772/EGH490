@@ -1,0 +1,63 @@
+# ===========================================================================
+# motion_controller.yaml -- controller_manager node, SHARED by all aircraft
+# ===========================================================================
+#
+# Passed as:
+#   ros2 launch as2_motion_controller controller_launch.py \
+#       namespace:=droneN \
+#       config_file:=<this file> \
+#       plugin_name:=pid_speed_controller \
+#       plugin_config_file:=config/pid_speed_controller.yaml
+#
+# `plugin_name` is given on the command line, not in this file, for the same
+# reason the state estimator's is: a plugin swap is a change of what is
+# flying the aircraft and must not be possible by editing a yaml that some
+# other tool also writes.
+#
+# WHY pid_speed_controller AND NOT differential_flatness_controller
+#
+# The choice is forced by the platform, not by preference. The patched
+# as2_platform_pixhawk advertises exactly five control modes (read from its
+# installed config/control_modes.yaml and confirmed in the node's start-up
+# log):
+#
+#     UNSET
+#     ACRO             + yaw speed + body FLU
+#     ATTITUDE         + yaw angle + ENU
+#     SPEED            + yaw angle + ENU
+#     SPEED            + yaw speed + ENU
+#
+# POSITION and TRAJECTORY are commented out upstream. So the only thing the
+# aircraft will accept for waypoint flight is a SPEED setpoint in ENU, and
+# pid_speed_controller is the plugin that turns the position and trajectory
+# references the behaviors emit into exactly that. This also means the
+# position loop closes on the GROUND-FRAME mocap solution inside this node,
+# on the Jetson, which is why the controller never crosses wifi.
+# ===========================================================================
+
+/**:
+  ros__parameters:
+
+    # 100 Hz, matched to the platform's cmd_freq in both platform_pixhawk.yaml
+    # and platform_sim.yaml. A controller running faster than the platform
+    # consumes it only adds queueing.
+    cmd_freq: 100.0
+    info_freq: 10.0
+
+    # Frame names, namespaced by as2 into "<namespace>/<frame>". These must
+    # agree with the state estimator, which broadcasts
+    # <ns>/odom -> <ns>/base_link from every accepted mocap sample.
+    odom_frame_id: "odom"
+    base_frame_id: "base_link"
+
+    # Bypass lets a reference already expressed in a mode the platform
+    # supports go straight through instead of being re-derived. Left at the
+    # upstream default.
+    use_bypass: true
+
+    # 50 ms at a 100 Hz mocap rate is five samples of slack. Note this is
+    # HALF the platform's external_odom_timeout_s (0.1 s): the controller
+    # gives up on a stale transform before the platform stops feeding PX4,
+    # so the failure surfaces here first, with a name, rather than as a
+    # silent loss of vision aiding.
+    tf_timeout_threshold: 0.05

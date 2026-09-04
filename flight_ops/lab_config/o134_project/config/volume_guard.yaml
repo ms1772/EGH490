@@ -1,0 +1,132 @@
+# ===========================================================================
+# volume_guard.yaml -- S2 watchdog thresholds, ground station, SHARED
+# ===========================================================================
+#
+# Passed as:
+#   python3 flight_ops/nodes/volume_guard.py \
+#       --drones ... --fmu-prefix ... --target-systems ... [--arm] \
+#       --ros-args --params-file <this file> [-r <remaps>]
+#
+# volume_guard.py itself is SAFETY-CRITICAL AND NOT MODIFIED BY THIS PROJECT.
+# This file only supplies its parameters. Command-line flags beat everything
+# here (`_pick(cli.value, parameter)`), which is why the four values that are
+# derived from config/drones.yaml -- drones, rigid_bodies, target_systems,
+# fmu_prefix -- are DELIBERATELY ABSENT: session_bringup.sh computes them from
+# the one table so the guard and the aircraft can never disagree about which
+# airframe is which.
+#
+# Every threshold below is written out even where it equals the node's own
+# default. On a safety watchdog, "what is it actually set to" must be
+# answerable by reading one file, not by reading one file and then reading
+# the source for everything the file does not mention.
+#
+# ---------------------------------------------------------------------------
+# WHY THE GUARD SITS ABOVE THE COMMANDED ENVELOPE, NOT ON IT
+# ---------------------------------------------------------------------------
+# lab_config/px4_indoor_params.yaml commands 1.5 m/s and 25 deg. This guard
+# trips at 2.0 m/s and 35 deg. A watchdog set at the commanded limit fires on
+# every normal traverse, gets reset reflexively, and is then not a watchdog.
+# The gap between the two numbers is the whole design.
+# ---------------------------------------------------------------------------
+
+/**:
+  ros__parameters:
+
+    # -- the volume -------------------------------------------------------
+    # O-134's netted enclosure. The fence sits `fence_margin_m` INSIDE the
+    # net; 0.5 m is a little more than the ~0.4 m stopping distance at
+    # MPC_XY_VEL_MAX 1.5 m/s and the PX4 default MPC_ACC_HOR 3 m/s^2, so an
+    # aircraft that trips the fence at the commanded envelope speed can still
+    # stop before it touches netting.
+    box_size_m: [8.0, 6.0, 4.0]
+
+    # MUST BE DETERMINED -- README.md, MBD-5.
+    # (0, 0, 0) says the mocap origin is at the CENTRE of the volume,
+    # including vertically, i.e. z = 0 is 2 m above the floor. If Motive's
+    # origin is instead set on the floor, this must become [0.0, 0.0, 2.0]
+    # or the ceiling half of the fence lands underground and the floor half
+    # is unprotected. Measure it in Motive on the first lab visit; it is a
+    # ten-second check and getting it wrong disables half the fence.
+    #
+    # This must agree with the earth_to_map_* values in
+    # config/mocap_pose_guarded.yaml, which are identity, and with
+    # box_center_m in config/fake_mocap_r1.yaml.
+    box_center_m: [0.0, 0.0, 0.0]
+    fence_margin_m: 0.5
+
+    # -- staleness --------------------------------------------------------
+    # Equal to external_odom_timeout_s in config/platform_pixhawk.yaml, so
+    # this guard and the S3 staleness gate in the patched platform agree
+    # about what "stale" means. If they ever have to differ, this one is the
+    # one that must be tighter -- it is the independent check on the other.
+    mocap_timeout_s: 0.1
+
+    # Looser, because self_localization is a derived, lower-rate product and
+    # a brief gap there is not the same event as losing the source.
+    pose_timeout_s: 0.5
+
+    # -- kinematic limits -------------------------------------------------
+    max_speed_mps: 2.0
+    max_tilt_deg: 35.0
+
+    # How far self_localization may disagree with raw mocap before that is
+    # itself a fault. preflight_check.py uses 5 cm for a stationary aircraft
+    # on the pad; in flight the estimator legitimately lags the raw feed, so
+    # 30 cm here is the "lost the plot" threshold, not an accuracy budget.
+    max_pose_delta_m: 0.30
+
+    # Speed is differenced over this window, not sample to sample: at 100 Hz
+    # and ~2 mm of mocap jitter a single-sample difference is ~0.3 m/s of
+    # pure noise, which would trip `overspeed` on a stationary aircraft.
+    speed_window_s: 0.1
+
+    # -- startup ----------------------------------------------------------
+    # The guard starts before the mocap bridge and the estimator do. Without
+    # a grace it latches a trip on every launch, and a crew that resets a
+    # latching guard reflexively before every flight has no latching guard.
+    # 5 s comfortably covers the ~3 s the estimator takes to come up.
+    startup_grace_s: 5.0
+
+    # -- rates ------------------------------------------------------------
+    rate_hz: 50.0
+    status_rate_hz: 5.0
+    land_speed_mps: 0.5
+
+    # /fmu/in/* is best-effort over uXRCE-DDS, so one datagram can be lost.
+    # The last line of defence does not get to depend on a single packet.
+    disarm_repeat: 5
+
+    # -- topics -----------------------------------------------------------
+    mocap_topic: "/mocap/rigid_bodies"
+
+    # The NESTED health schema from flight_ops/nodes/vrpn_to_rigidbodies.py,
+    # which covers every body at once and reports what the mocap LINK is
+    # doing -- upstream of any estimator. The per-drone
+    # /<ns>/mocap_health from the guarded plugin is the downstream
+    # cross-check and is read by preflight_check.py instead.
+    #
+    # IN --sim THIS TOPIC DOES NOT EXIST. fake_mocap.py publishes its own
+    # status on /fake_mocap/status and no /mocap/health. health_tracked()
+    # then returns None (unknown), never False, so the `mocap_untracked`
+    # condition simply never trips on the rig. That is correct and it is why
+    # `mocap_timeout` -- which measures arrival times against the guard's own
+    # clock and needs no health topic at all -- is the condition the rig
+    # actually exercises.
+    health_topic: "/mocap/health"
+
+    pose_topic_template: "/{ns}/self_localization/pose"
+    land_action_template: "/{ns}/LandBehavior"
+    status_topic: "/volume_guard/status"
+    reset_topic: "/volume_guard/reset"
+
+    # -- escalation ladder ------------------------------------------------
+    # NAME:LADDER:CONFIRM:ESCALATE. Left empty => the node's own defaults,
+    # which are warn+land+disarm on every condition with per-condition dwell
+    # times. Those dwells are a run-sheet decision (which conditions may
+    # reach DISARM, and after how long) and are set on the card, in front of
+    # the crew, not silently here.
+    #
+    # To tighten the fence for a specific session, add e.g.
+    #   policies: ["geofence:land+disarm:0.1:0.5"]
+    # and record the change on the card.
+    policies: [""]

@@ -1,0 +1,90 @@
+# ===========================================================================
+# drones.yaml -- THE per-aircraft overlay. The ONLY file in this project
+#                where the three airframes differ.
+# ===========================================================================
+#
+# Every other file under config/ is shared verbatim by all three aircraft.
+# The four values that differ live here, in one table, side by side, so a
+# mismatch is visible by reading four short rows instead of diffing three
+# near-identical parameter files that will drift apart within a fortnight.
+#
+# This file is NOT a ROS parameter file and is never passed to a node.
+# `flight_ops/session_bringup.sh` reads it and turns each row into LAUNCH
+# ARGUMENTS, which is the mechanism Aerostack2 actually supports for
+# per-instance overrides (see README.md, "Why one file plus launch
+# arguments").
+#
+# ---------------------------------------------------------------------------
+# THE COUPLING THAT MATTERS
+# ---------------------------------------------------------------------------
+# `fmu_prefix` here MUST correspond to `UXRCE_DDS_NS_IDX` on that aircraft's
+# flight controller:
+#
+#       UXRCE_DDS_NS_IDX = N   ->   PX4 publishes /uav_N/fmu/...
+#                              ->   fmu_prefix must be "/uav_N"
+#
+# UXRCE_DDS_NS_IDX is an FC parameter. It is written with QGroundControl and
+# it is `reboot_required`. Nothing in this repository sets it. It is recorded
+# in the `uxrce_dds_ns_idx` column below ONLY so the two halves of the
+# coupling can be checked against each other in one place; the column is
+# advisory and the launcher does not use it.
+#
+# If they disagree, the platform node subscribes and publishes into a
+# namespace no flight controller is using. The symptom is a platform that
+# starts cleanly, reports `connected: false` forever, and looks like a
+# network problem.
+# ===========================================================================
+
+meta:
+  volume: O-134 netted enclosure, 8 m x 6 m x 4 m usable
+  fleet: 3x Holybro X500 V2, Pixhawk / PX4 v1.17.0, Jetson Orin NX
+  ros_domain_id: 0
+  # All three flight controllers sit on ROS_DOMAIN_ID 0 (UXRCE_DDS_DOM_ID=0,
+  # gated in lab_config/expected_state.yaml). Separation is by DDS namespace,
+  # not by domain.
+
+drones:
+
+  drone0:
+    # Aerostack2 namespace is the key. It is what deckga_execute.py,
+    # preflight_check.py and volume_guard.py all address the aircraft by, and
+    # it is deliberately NOT the same string as the PX4 DDS namespace.
+    fmu_prefix: "/uav_0"
+    uxrce_dds_ns_idx: 0        # FC-side, advisory here. See the note above.
+    target_system_id: 1        # MUST BE DETERMINED -- see README, MBD-2
+    rigid_body_name: "drone0"  # MUST match the Motive body name EXACTLY
+
+  drone1:
+    fmu_prefix: "/uav_1"
+    uxrce_dds_ns_idx: 1
+    target_system_id: 1        # MUST BE DETERMINED -- see README, MBD-2
+    rigid_body_name: "drone1"
+
+  drone2:
+    fmu_prefix: "/uav_2"
+    uxrce_dds_ns_idx: 2
+    target_system_id: 1        # MUST BE DETERMINED -- see README, MBD-2
+    rigid_body_name: "drone2"
+
+# ---------------------------------------------------------------------------
+# WHY target_system_id IS 1 ON ALL THREE, AND WHY THAT IS NOT A TYPO
+# ---------------------------------------------------------------------------
+# `target_system_id` is the MAVLink system id the platform stamps into every
+# VehicleCommand it sends (arm, disarm, offboard). PX4 accepts a command only
+# if it matches that airframe's MAV_SYS_ID.
+#
+# MAV_SYS_ID is NOT in the managed-parameter allow-list in
+# lab_config/expected_state.yaml, so this project does not write it, and the
+# PX4 factory value is 1. Three aircraft therefore all answer to system id 1
+# -- which is safe here ONLY because UXRCE_DDS_NS_IDX has already put each
+# one on its own set of topics. The topic is what aims the command; the
+# system id is the second check, not the first.
+#
+# If the lab has assigned distinct MAV_SYS_IDs to the three airframes, put
+# them here (1 / 2 / 3) AFTER reading each one back in QGroundControl. Do not
+# assume. A wrong id here means arm and disarm are silently ignored by the
+# aircraft.
+#
+# volume_guard's --target-systems is derived from this table by
+# session_bringup.sh, so the two can never disagree.
+# ---------------------------------------------------------------------------

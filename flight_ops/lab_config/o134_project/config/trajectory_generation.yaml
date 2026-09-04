@@ -1,0 +1,64 @@
+# ===========================================================================
+# trajectory_generation.yaml -- polynomial trajectory behaviour, SHARED
+# ===========================================================================
+#
+# Passed as:
+#   ros2 launch as2_behaviors_trajectory_generation \
+#       generate_polynomial_trajectory_behavior_launch.py \
+#       namespace:=droneN config_file:=<this file> use_sim_time:=false
+#
+# This behaviour is launched but NOT on the critical path for O-134.
+# config/motion_behaviors.yaml selects the *_plugin_position variants of
+# takeoff / go_to / follow_path, none of which route through here. It is
+# started anyway because:
+#
+#   * as2_python_api's DroneInterface constructs a client for it, and
+#     deckga_execute.py builds a DroneInterface per namespace. A missing
+#     action server there shows up as a hang at mission start, in the lab,
+#     which is exactly the class of surprise this project exists to remove.
+#   * switching one behaviour to its trajectory variant during tuning must
+#     not require editing the launcher.
+#
+# frequency_update_frame is left at 0.0 (no re-transform of queued waypoints
+# when map->odom moves). With the guarded plugin, map->odom is published as
+# IDENTITY on every sample and earth->map is a static transform fixed at
+# setup, so there is nothing for it to track. Turning it on would spend CPU
+# re-solving a transform that is a constant by construction.
+# ===========================================================================
+
+/**:
+  ros__parameters:
+
+    # 50 ms, matched to the controller and the behaviours.
+    tf_timeout_threshold: 0.05
+
+    # Sampling of the generated polynomial. 100 Hz (dt = 0.01), matched to
+    # the controller and platform command rates.
+    sampling_n: 1
+    sampling_dt: 0.01
+
+    # 0 = generate over the full waypoint list rather than a moving horizon.
+    # An O-134 path is a handful of waypoints inside 8 x 6 m; there is no
+    # horizon worth having.
+    path_lenght: 0
+
+    # Below 0.1 m of travel the heading is held instead of being recomputed,
+    # so the aircraft does not spin on the spot chasing the yaw implied by
+    # mocap noise while it is nominally stationary.
+    yaw_threshold: 0.1
+    yaw_speed_threshold: 6.0
+
+    # See the header note. Both left at the upstream defaults.
+    frequency_update_frame: 0.0
+    transform_threshold: 1.0
+    wp_close_threshold: 0.0
+
+    # Debug topics are relative names, so they land under
+    # /<namespace>/debug/... . Kept enabled: they are what RViz shows when a
+    # follow_path goes somewhere unexpected, and they cost nothing when
+    # nobody subscribes.
+    debug:
+      path_topic: "debug/traj_generated"
+      reference_setpoint: "debug/ref_traj_point"
+      reference_end_waypoint: "debug/ref_traj_end_point"
+      reference_waypoints: "debug/waypoints"

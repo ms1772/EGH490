@@ -1,0 +1,95 @@
+# ===========================================================================
+# fake_mocap_r1.yaml -- synthetic mocap source, rig R1 ONLY (--sim)
+# ===========================================================================
+#
+# Passed as:
+#   python3 flight_ops/nodes/fake_mocap.py --mode rigidbodies \
+#       --bodies <rigid_body_name per drone> \
+#       --ros-args --params-file <this file>
+#
+# fake_mocap.py stands in for OptiTrack + the VRPN client + the bridge. In
+# --sim it is the ONLY thing feeding the state estimator, which is what makes
+# the rig a test of the mocap chain rather than of a flight model.
+#
+# `--mode rigidbodies` publishes mocap4r2_msgs/RigidBodies directly on
+# /mocap/rigid_bodies, bypassing vrpn_to_rigidbodies.py. That is deliberate
+# for THIS rig: the object under test is the state estimator's plugin, and
+# the bridge has its own bench procedure. Use `--mode vrpn` when the bridge
+# is what is being exercised.
+#
+# `--bodies` comes from the rigid_body_name column of config/drones.yaml, so
+# the rig reproduces the exact strings the plugin will be asked to match. A
+# name that is wrong here fails the same way a Motive typo fails in the lab
+# -- which is the point.
+#
+# WHAT THIS FILE MUST AGREE WITH
+#   box_size_m / box_center_m  <->  config/volume_guard.yaml (same room)
+#   trackers                   <->  ignored; --bodies on the CLI wins
+# ===========================================================================
+
+/**:
+  ros__parameters:
+
+    # -- output -----------------------------------------------------------
+    mode: "rigidbodies"
+    output_topic: "/mocap/rigid_bodies"
+
+    # The header frame the real bridge stamps, inherited from the VRPN
+    # client's frame_id. The guarded plugin does not read it -- it treats the
+    # sample as already-ENU in the earth frame -- but keeping it faithful
+    # means anything that DOES read it behaves on the rig as it will in the
+    # lab.
+    frame_id: "map"
+
+    # -- rate -------------------------------------------------------------
+    # 100 Hz is the OptiTrack rate this stack is built around: it is what
+    # external_odom_timeout_s (0.1 s = 10 cycles) is sized against and what
+    # preflight_check.py's mocap_rate check expects (min 95 Hz sustained).
+    publish_rate_hz: 100.0
+    status_period_s: 1.0
+
+    # -- the volume -------------------------------------------------------
+    # O-134, matching config/volume_guard.yaml. box_margin_m keeps the
+    # SYNTHETIC MOTION 0.5 m off the net; the geofence lives further in
+    # still, so a nominal run never trips the guard's `geofence` condition
+    # and a trip during a sim run is real information.
+    box_size_m: [8.0, 6.0, 4.0]
+    box_center_m: [0.0, 0.0, 0.0]
+    box_margin_m: 0.5
+
+    # -- trajectory -------------------------------------------------------
+    # `circle` rather than `static` or `hover_jitter`, for two reasons:
+    #
+    #   1. A moving body is the only way to tell "the estimator is tracking"
+    #      from "the estimator is publishing the origin". A static body makes
+    #      defect D1 -- the origin pose on a name mismatch -- INVISIBLE,
+    #      because the origin is where the body already is.
+    #   2. It exercises the twist path. A finite difference of a constant is
+    #      zero whether or not the filter works.
+    #
+    # 20 s period on a circle inside the margin gives well under the 1.5 m/s
+    # commanded envelope, so nothing downstream sees a speed it would refuse.
+    trajectory: "circle"
+    period_s: 20.0
+
+    # 2 mm 1-sigma, matching the static noise the I-02 card expects from the
+    # real rig. Deterministic, not random: a bound that holds only in
+    # probability is not a bound.
+    jitter_m: 0.002
+
+    # -- faults -----------------------------------------------------------
+    # NONE by default. The nominal chain must come up clean before any fault
+    # is injected, and faults belong to a specific bench card, not to every
+    # launch. Inject at runtime instead, which is timed from the moment of
+    # injection and needs no restart:
+    #
+    #   ros2 topic pub --once /fake_mocap/inject std_msgs/msg/String \
+    #       "{data: 'name_mismatch+10'}"
+    #   ros2 topic pub --once /fake_mocap/inject std_msgs/msg/String \
+    #       "{data: 'freeze+5'}"
+    #   ros2 service call /fake_mocap/clear_faults std_srvs/srv/Trigger
+    #
+    # `freeze` is the one to run first: a frozen feed looks perfectly healthy
+    # on `ros2 topic hz`, and it is the failure the platform's staleness gate
+    # and the guard's mocap_timeout both exist to catch.
+    faults: [""]

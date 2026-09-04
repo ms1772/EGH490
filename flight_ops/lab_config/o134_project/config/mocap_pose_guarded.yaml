@@ -1,0 +1,109 @@
+# ===========================================================================
+# mocap_pose_guarded.yaml -- state-estimator plugin, SHARED by all aircraft
+# ===========================================================================
+#
+# Passed as:
+#   ros2 launch as2_mocap_guarded mocap_pose_guarded_state_estimator.launch.py \
+#       namespace:=droneN \
+#       plugin_config_file:=<this file> \
+#       rigid_body_name:=<per drone> \
+#       mocap_topic:=<per mode>
+#
+# NOT the stock as2_state_estimator launch file. That one cannot load an
+# out-of-package plugin: `plugin_name` is declared with
+# choices=get_available_plugins('as2_state_estimator'), and the plugin's
+# default config path is hard-wired under the as2_state_estimator share
+# directory and open()ed unconditionally. Both were confirmed by running
+# them. See deckga_ros2/as2_mocap_guarded/README.md.
+#
+# The node this launches IS the stock as2_state_estimator_node. Only the
+# plugin is ours.
+#
+# TWO KEYS ARE DELIBERATELY ABSENT
+#
+#   rigid_body_name  per aircraft, from config/drones.yaml. It has no usable
+#                    default on purpose -- a wrong or missing body name is
+#                    defect D1, the reason the fork exists, so the plugin
+#                    throws at setup rather than tracking nothing quietly.
+#                    Putting a default here would destroy that guarantee.
+#
+#   mocap_topic      per MODE, not per aircraft:
+#                      --hardware  /<namespace>/mocap/rigid_bodies
+#                                  (one VRPN client + bridge per Jetson; see
+#                                   flight_ops/deploy/README.md section 2)
+#                      --sim       /mocap/rigid_bodies
+#                                  (one fake_mocap.py for the whole rig)
+#                    session_bringup.sh supplies it.
+#
+# Everything else below is genuinely shared. Three aircraft that disagree
+# about earth->map or about the velocity filter are three aircraft flying in
+# three different rooms.
+# ===========================================================================
+
+/**:
+  ros__parameters:
+
+    # -- D5: subscription QoS ---------------------------------------------
+    # vrpn_to_rigidbodies.py and mocap4r2's own drivers publish
+    # RigidBodies BEST_EFFORT. Upstream hard-codes a RELIABLE subscription,
+    # which matches nothing, delivers zero messages, and logs nothing on the
+    # subscriber side. Do not set "reliable" unless the publisher changed too.
+    mocap_qos_reliability: "best_effort"
+
+    # -- D2: earth->map comes from parameters, not from the first sample ---
+    # All four zero => earth == map == the lab frame, published once at
+    # setup, before any mocap arrives, identically for every aircraft
+    # regardless of process start order.
+    #
+    # These are the values preflight_check.py's tf_tree check asserts are
+    # IDENTITY (DEFAULT_TF_IDENTITY_LINKS = "earth->map,map->odom"). Change
+    # them only if the lab frame is deliberately offset from the mocap
+    # origin, change them for EVERY aircraft in the session, and expect to
+    # re-argue the preflight identity check.
+    earth_to_map_x: 0.0
+    earth_to_map_y: 0.0
+    earth_to_map_z: 0.0
+    earth_to_map_yaw: 0.0
+
+    # -- D3: velocity smoothing -------------------------------------------
+    # Twist is a finite difference of position. At the O-134 rig's ~2 mm 1
+    # sigma static noise and 100 Hz, an unfiltered difference is ~0.28 m/s of
+    # pure noise into the speed controller.
+    #
+    # 0.2 gives a ~3.2 Hz corner and ~40 ms of group delay, against a
+    # multirotor position loop bandwidth of roughly 0.5-1.5 Hz: the whole
+    # control-relevant band passes and the differentiation noise drops
+    # threefold to ~0.094 m/s. 1.0 reproduces upstream (filter off).
+    twist_smooth_filter_cte: 0.2
+
+    # Left OFF at 1.0 on purpose. The upstream blend is component-wise and
+    # does not renormalise, so any value below 1.0 emits a non-unit
+    # quaternion -- which this plugin's own D4 validation would then reject.
+    orientation_smooth_filter_cte: 1.0
+
+    # -- D4: input validation ---------------------------------------------
+    # |norm(q) - 1| above this and the sample is DROPPED, never replaced by
+    # the last good pose. 1e-3 also catches the all-zero quaternion a
+    # partially-solved marker set produces.
+    quaternion_tolerance: 0.001
+
+    # -- health -----------------------------------------------------------
+    # Seconds without an ACCEPTED sample before mocap_health reports
+    # tracked: false.
+    #
+    # Deliberately 2.5x the platform's external_odom_timeout_s (0.1 s) and
+    # 2.5x volume_guard's --mocap-timeout (0.1 s). The two 0.1 s gates are
+    # the ones that ACT; this one only reports. Making the reporter the
+    # fastest of the three would fill the log with warnings about outages
+    # the acting gates had already handled.
+    mocap_timeout: 0.25
+
+    # Relative name => /<namespace>/mocap_health. Timer-driven, so it keeps
+    # reporting a growing `age` right through a total mocap outage instead of
+    # falling silent exactly when it is needed.
+    mocap_health_topic: "mocap_health"
+    mocap_health_rate: 2.0
+
+    # Seconds between repeated fault log lines. A 100 Hz fault logged
+    # unthrottled is a denial of service on the operator.
+    log_throttle_period: 2.0

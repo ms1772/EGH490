@@ -1,0 +1,116 @@
+<%
+# ===========================================================================
+# drone.yaml -- one tmux session per aircraft.
+#
+# Started by flight_ops/session_bringup.sh. Do not run tmuxinator against
+# this file by hand: every setting below is mandatory and several of them are
+# derived from config/drones.yaml, so a hand-typed invocation is exactly the
+# drift this project exists to prevent.
+#
+#     tmuxinator start -n o134_<ns> -p tmuxinator/drone.yaml <settings>
+#
+# The panes are grouped the same way the Aerostack2 Gazebo reference project
+# groups them -- platform / basics / behaviors -- so anyone who has used that
+# project can read this one.
+#
+# Paths are exported once, quoted, into O134_PROJECT and O134_REPO, because
+# the repository lives under a directory with a SPACE in its name on the
+# ground station ("Multi-UAV Project"). Every path below is used through
+# those variables, in double quotes. An unquoted path here would split into
+# two arguments and the launch would fail with a file-not-found naming half a
+# directory.
+# ===========================================================================
+ns          = @settings["drone_namespace"]
+mode        = @settings["mode"]
+project_dir = @settings["project_dir"]
+ws_setup    = @settings["ws_setup"]
+repo_root   = @settings["repo_root"]
+domain_id   = @settings["ros_domain_id"]
+fmu_prefix  = @settings["fmu_prefix"]
+sys_id      = @settings["target_system_id"]
+body        = @settings["rigid_body_name"]
+mocap_topic = @settings["mocap_topic"]
+log_level   = @settings["log_level"]
+sim         = (mode == "sim")
+%>
+name: o134_<%= ns %>
+attach: false
+startup_window: basics
+
+# `set +u` first: the ROS setup scripts dereference unset variables and abort
+# a strict shell. This is the same rule as everywhere else in flight_ops.
+pre_window: set +u && source /opt/ros/humble/setup.bash && source "<%= ws_setup %>" && export ROS_DOMAIN_ID=<%= domain_id %> && export O134_PROJECT="<%= project_dir %>" && export O134_REPO="<%= repo_root %>"
+
+windows:
+
+  # -- the platform: the only component that differs between modes ---------
+  - platform:
+      layout: even-vertical
+      panes:
+<%- if sim -%>
+        # RIG R1. Simulated multirotor. No flight controller, no FMU topics.
+        # Not a flight model under test -- see config/platform_sim.yaml.
+        - ros2 launch as2_platform_multirotor_simulator as2_platform_multirotor_simulator.launch.py
+            namespace:=<%= ns %>
+            use_sim_time:=false
+            log_level:=<%= log_level %>
+            config_file:="$O134_PROJECT/config/platform_sim.yaml"
+<%- else -%>
+        # O-134. Patched as2_platform_pixhawk @ 2b00b77 + the O134 patch.
+        # fmu_prefix and target_system_id are the per-aircraft values from
+        # config/drones.yaml; they are launch ARGUMENTS because
+        # platform_pixhawk.yaml deliberately omits both keys (a key present
+        # in the file would beat the command line -- see README).
+        # This launch file declares neither use_sim_time nor log_level.
+        - ros2 launch as2_platform_pixhawk pixhawk_launch.py
+            namespace:=<%= ns %>
+            platform_config_file:="$O134_PROJECT/config/platform_pixhawk.yaml"
+            fmu_prefix:=<%= fmu_prefix %>
+            target_system_id:=<%= sys_id %>
+<%- end -%>
+
+  # -- state estimation and control ----------------------------------------
+  - basics:
+      layout: even-vertical
+      panes:
+        # The STOCK as2_state_estimator node carrying the mocap_pose_guarded
+        # plugin. Launched from as2_mocap_guarded's own launch file because
+        # the stock one cannot load an out-of-package plugin.
+        #
+        # rigid_body_name has no usable default and the plugin throws if it
+        # is empty. That is defect D1 refusing to happen quietly.
+        - ros2 launch as2_mocap_guarded mocap_pose_guarded_state_estimator.launch.py
+            namespace:=<%= ns %>
+            use_sim_time:=false
+            log_level:=<%= log_level %>
+            plugin_config_file:="$O134_PROJECT/config/mocap_pose_guarded.yaml"
+            rigid_body_name:=<%= body %>
+            mocap_topic:=<%= mocap_topic %>
+        # pid_speed_controller, not differential_flatness: the Pixhawk
+        # platform advertises SPEED and ATTITUDE, never POSITION. plugin_name
+        # is on the command line so no yaml can swap what is flying.
+        - ros2 launch as2_motion_controller controller_launch.py
+            namespace:=<%= ns %>
+            use_sim_time:=false
+            log_level:=<%= log_level %>
+            config_file:="$O134_PROJECT/config/motion_controller.yaml"
+            plugin_name:=pid_speed_controller
+            plugin_config_file:="$O134_PROJECT/config/pid_speed_controller.yaml"
+
+  # -- action servers the ground station calls ------------------------------
+  - behaviors:
+      layout: even-vertical
+      panes:
+        - ros2 launch as2_behaviors_motion motion_behaviors_launch.py
+            namespace:=<%= ns %>
+            use_sim_time:=false
+            log_level:=<%= log_level %>
+            config_file:="$O134_PROJECT/config/motion_behaviors.yaml"
+        # Not on the critical path -- the *_plugin_position behaviours do not
+        # use it -- but as2_python_api's DroneInterface builds a client for
+        # it, so a missing server is a hang at mission start.
+        - ros2 launch as2_behaviors_trajectory_generation generate_polynomial_trajectory_behavior_launch.py
+            namespace:=<%= ns %>
+            use_sim_time:=false
+            log_level:=<%= log_level %>
+            config_file:="$O134_PROJECT/config/trajectory_generation.yaml"

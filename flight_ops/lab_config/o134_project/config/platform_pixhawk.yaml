@@ -1,0 +1,81 @@
+# ===========================================================================
+# platform_pixhawk.yaml -- as2_platform_pixhawk, SHARED by all three aircraft
+# ===========================================================================
+#
+# Passed as:
+#   ros2 launch as2_platform_pixhawk pixhawk_launch.py \
+#       namespace:=droneN platform_config_file:=<this file> \
+#       fmu_prefix:=/uav_N target_system_id:=<id>
+#
+# `fmu_prefix` and `target_system_id` are DELIBERATELY ABSENT from this file.
+# They are the per-aircraft values and they arrive as launch arguments from
+# config/drones.yaml. as2_core's LaunchConfigurationFromConfigFile merges in
+# this order:
+#
+#   installed package default  <-  launch arguments  <-  THIS FILE
+#
+# so any key present here BEATS the command line. Adding fmu_prefix here
+# would silently pin all three aircraft to one FMU namespace and the launch
+# argument would be ignored without a word. Verified by running it; see
+# README.md.
+#
+# Platform version: as2_platform_pixhawk @ 2b00b77 + flight_ops/patches/
+#                   as2_platform_pixhawk_o134.patch
+# Autopilot:        PX4 v1.17.0
+# ===========================================================================
+
+/**:
+  ros__parameters:
+
+    # -- command and telemetry rates -------------------------------------
+    # 100 Hz is the upstream default and it is also the rate of the visual
+    # odometry timer that feeds /fmu/in/vehicle_visual_odometry, so the two
+    # stay in step. Do not lower it without re-measuring the staleness gate.
+    cmd_freq: 100.0
+    info_freq: 10.0
+
+    # -- thrust mapping ---------------------------------------------------
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    # MUST BE DETERMINED -- run-sheet card I-04 (restrained motor check).
+    # See README.md, MBD-1.
+    #
+    # 15.0 N is the UPSTREAM DEFAULT shipped with as2_platform_pixhawk. It
+    # is NOT a measured value for a Holybro X500 V2 and there is no reason
+    # to believe it is correct for one.
+    #
+    # Aerostack2 uses max_thrust to convert a commanded thrust in newtons
+    # into PX4's normalised 0..1 setpoint. If this number is wrong the
+    # ENTIRE thrust axis is mis-scaled by a constant factor:
+    #   too low   -> every command saturates, the aircraft leaps on takeoff
+    #   too high  -> commands are attenuated, the aircraft is sluggish or
+    #                will not leave the ground, and the altitude loop winds
+    #                up trying to fix it
+    # Both read like a controller tuning problem. Neither is. Nobody tunes
+    # their way out of a wrong unit conversion.
+    #
+    # Determine it on the bench, props on, airframe restrained, from the
+    # measured total static thrust of the four motors at full throttle on a
+    # charged 4S pack. Record the measurement and the pack voltage on the
+    # card, then write the value here and re-run the sim chain.
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    max_thrust: 15.0
+    min_thrust: 0.15
+
+    # -- external odometry (motion capture) -------------------------------
+    # THE indoor setting. With external_odom true the platform runs a 100 Hz
+    # timer that copies the state-estimator solution into
+    # /fmu/in/vehicle_visual_odometry, which is how mocap reaches EKF2.
+    # Indoors there is no other source of position: EKF2_GPS_CTRL is 0.
+    external_odom: true
+
+    # Change 6 in flight_ops/patches/PATCHES.md. If the last usable external
+    # odometry sample is older than this, the platform publishes NOTHING to
+    # PX4, so PX4's own external-vision failsafe can run. Without the gate a
+    # frozen mocap pose is re-stamped with now() at 100 Hz and EKF2 sees a
+    # perfectly healthy, perfectly stationary vehicle.
+    #
+    # 0.1 s = 10 cycles of the 100 Hz timer. PATCHES.md lists this value as
+    # unverified against the real OptiTrack chain: log the inter-arrival
+    # distribution on the bench and raise it if real jitter trips it.
+    # See README.md, MBD-3.
+    external_odom_timeout_s: 0.1

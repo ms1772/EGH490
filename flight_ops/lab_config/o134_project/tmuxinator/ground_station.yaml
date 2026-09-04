@@ -1,0 +1,92 @@
+<%
+# ===========================================================================
+# ground_station.yaml -- the one tmux session that watches the whole fleet.
+#
+# Started by flight_ops/session_bringup.sh:
+#
+#     tmuxinator start -n o134_ground -p tmuxinator/ground_station.yaml <settings>
+#
+# WHAT LIVES HERE AND WHY IT IS NOT ON AN AIRCRAFT
+#
+#   volume_guard.py  It must see every aircraft at once, and it must not be
+#                    running on the machine it may have to disarm. It
+#                    publishes VehicleCommand STRAIGHT to PX4, deliberately
+#                    not through the platform node -- the platform node is
+#                    one of the things that can hang.
+#   RViz             There is no display on a Jetson and ros-humble-desktop is
+#                    deliberately not installed on one.
+#   alphanumeric     What a human reads. Same reason.
+#   fake_mocap.py    Rig R1 only. It replaces OptiTrack, so it belongs where
+#                    the mocap bridge would be, not on an airframe.
+#
+# `guard_args` and `guard_ros_args` are built by session_bringup.sh from
+# config/drones.yaml and arrive here as pre-quoted strings: the namespaces,
+# the rigid bodies, the FMU prefix and the target system ids in the first;
+# and in --hardware the ROS remap rules that carry /<ns>/fmu/... to
+# /uav_N/fmu/... in the second. They are emitted verbatim. Do not add quoting
+# around either; they already carry their own.
+#
+# The remaps are in a SEPARATE setting because they must sit inside the
+# `--ros-args` group, after --params-file.
+# ===========================================================================
+drones      = @settings["drones_comma"]
+mode        = @settings["mode"]
+project_dir = @settings["project_dir"]
+repo_root   = @settings["repo_root"]
+ws_setup    = @settings["ws_setup"]
+domain_id   = @settings["ros_domain_id"]
+guard_args  = @settings["guard_args"]
+guard_ros_args = @settings["guard_ros_args"]
+mocap_bodies = @settings["mocap_bodies"]
+rviz        = @settings["rviz"] == "true"
+viewer      = @settings["viewer"] == "true"
+sim         = (mode == "sim")
+%>
+name: o134_ground
+attach: false
+startup_window: safety
+
+pre_window: set +u && source /opt/ros/humble/setup.bash && source "<%= ws_setup %>" && export ROS_DOMAIN_ID=<%= domain_id %> && export O134_PROJECT="<%= project_dir %>" && export O134_REPO="<%= repo_root %>"
+
+windows:
+
+  # -- the last line of defence, and the mocap source on the rig -----------
+  - safety:
+      layout: even-vertical
+      panes:
+<%- if sim -%>
+        # RIG R1 ONLY. Synthetic mocap standing in for OptiTrack + VRPN +
+        # the bridge. Faults are injected at runtime on /fake_mocap/inject,
+        # never scheduled here -- the nominal chain comes up clean first.
+        - python3 "$O134_REPO/flight_ops/nodes/fake_mocap.py"
+            --mode rigidbodies
+            --bodies <%= mocap_bodies %>
+            --ros-args --params-file "$O134_PROJECT/config/fake_mocap_r1.yaml"
+<%- end -%>
+        # DRY RUN unless session_bringup.sh was given --guard-arm. In dry run
+        # it logs the land and disarm it WOULD have sent and sends nothing.
+        - python3 "$O134_REPO/flight_ops/nodes/volume_guard.py" <%= guard_args %>
+            --ros-args --params-file "$O134_PROJECT/config/volume_guard.yaml" <%= guard_ros_args %>
+
+<%- if viewer -%>
+  # -- what the crew reads --------------------------------------------------
+  - monitoring:
+      layout: tiled
+      panes:
+<%- drones.split(',').each do |d| -%>
+        - ros2 run as2_alphanumeric_viewer as2_alphanumeric_viewer_node --ros-args -r __ns:=/<%= d %>
+<%- end -%>
+<%- end -%>
+
+<%- if rviz -%>
+  # -- visualisation ---------------------------------------------------------
+  # swarm_viz launches one as2_visualization per namespace and RViz once, off
+  # the first namespace. use_sim_time is false, as everywhere in this project.
+  - viz:
+      layout: even-vertical
+      panes:
+        - ros2 launch as2_visualization swarm_viz.launch.py
+            namespace_list:=<%= drones %>
+            use_sim_time:=false
+            rviz_config:="$O134_PROJECT/config_ground_station/o134.rviz"
+<%- end -%>
