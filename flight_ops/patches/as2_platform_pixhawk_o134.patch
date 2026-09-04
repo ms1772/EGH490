@@ -1,0 +1,252 @@
+diff --git a/config/platform_config_file.yaml b/config/platform_config_file.yaml
+index b778127..b393b3c 100644
+--- a/config/platform_config_file.yaml
++++ b/config/platform_config_file.yaml
+@@ -5,5 +5,6 @@
+     max_thrust: 15.0  # Max thrust to send to platform (N)
+     min_thrust: 0.15  # Min thrust to send to platform (N)
+     external_odom: false  # Flag to use external odometry source
++    external_odom_timeout_s: 0.1  # Stop feeding PX4 visual odometry if the external source is older than this (s)
+     fmu_prefix: '' # Prefix for FMU topics
+     target_system_id: 1  # Target system ID for mavros
+\ No newline at end of file
+diff --git a/include/as2_platform_pixhawk/pixhawk_platform.hpp b/include/as2_platform_pixhawk/pixhawk_platform.hpp
+index 4879210..244530d 100644
+--- a/include/as2_platform_pixhawk/pixhawk_platform.hpp
++++ b/include/as2_platform_pixhawk/pixhawk_platform.hpp
+@@ -46,7 +46,6 @@
+ #include <string>
+ 
+ #include <px4_msgs/msg/battery_status.hpp>
+-#include <px4_msgs/msg/manual_control_switches.hpp>
+ #include <px4_msgs/msg/offboard_control_mode.hpp>
+ #include <px4_msgs/msg/sensor_combined.hpp>
+ #include <px4_msgs/msg/sensor_gps.hpp>
+@@ -188,6 +187,15 @@ private:
+    * @param msg Twist of the vehicle, from an external localization system.
+    */
+   void externalOdomCb(const geometry_msgs::msg::TwistStamped::SharedPtr msg);
++  /**
++   * @brief Check whether the last external odometry sample is still fresh.
++   *
++   * Logs once (edge triggered) on the transition into the stale state and once
++   * on recovery.
++   *
++   * @return true if a sample was received less than external_odom_timeout_s ago.
++   */
++  bool isExternalOdomFresh();
+ 
+   // PX4 subscribers
+   rclcpp::Subscription<px4_msgs::msg::SensorCombined>::SharedPtr px4_imu_sub_;
+@@ -198,8 +206,6 @@ private:
+   rclcpp::Subscription<px4_msgs::msg::SensorGps>::SharedPtr px4_gps_sub_;
+ 
+   // PX4 publishers
+-  rclcpp::Publisher<px4_msgs::msg::ManualControlSwitches>::SharedPtr
+-    px4_manual_control_switches_pub_;
+   rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr px4_offboard_control_mode_pub_;
+   rclcpp::Publisher<px4_msgs::msg::TrajectorySetpoint>::SharedPtr px4_trajectory_setpoint_pub_;
+   rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr px4_vehicle_command_pub_;
+@@ -264,6 +270,14 @@ private:
+   float min_thrust_;
+   bool simulation_mode_ = false;
+   bool external_odom_ = true;
++  // External odometry staleness gate (S3). If no external odometry sample has
++  // arrived within external_odom_timeout_s_, publishing to
++  // /fmu/in/vehicle_visual_odometry stops so that PX4 raises its own external
++  // vision timeout instead of flying on a frozen pose.
++  double external_odom_timeout_s_ = 0.1;
++  rclcpp::Time last_external_odom_time_{0, 0, RCL_ROS_TIME};
++  bool external_odom_received_ = false;
++  bool external_odom_stale_ = true;
+   std::string base_link_frame_id_;
+   std::string odom_frame_id_;
+   int target_system_id_ = 1;
+diff --git a/src/pixhawk_platform.cpp b/src/pixhawk_platform.cpp
+index 2d0913c..15594c3 100644
+--- a/src/pixhawk_platform.cpp
++++ b/src/pixhawk_platform.cpp
+@@ -59,6 +59,11 @@ PixhawkPlatform::PixhawkPlatform(const rclcpp::NodeOptions & options)
+   this->declare_parameter<bool>("external_odom");
+   external_odom_ = this->get_parameter("external_odom").as_bool();
+ 
++  // External odometry staleness timeout (S3). Declared with a default so that
++  // existing config files keep working; 0.1 s == 10 timer cycles at 100 Hz.
++  this->declare_parameter<double>("external_odom_timeout_s", 0.1);
++  external_odom_timeout_s_ = this->get_parameter("external_odom_timeout_s").as_double();
++
+   std::string fmu_prefix = "";
+   this->declare_parameter<std::string>("fmu_prefix");
+   fmu_prefix = this->get_parameter("fmu_prefix").as_string();
+@@ -73,6 +78,8 @@ PixhawkPlatform::PixhawkPlatform(const rclcpp::NodeOptions & options)
+     this->get_logger(), "Simulation mode: %s",
+     this->get_parameter("use_sim_time").as_bool() ? "true" : "false");
+   RCLCPP_INFO(this->get_logger(), "External odometry mode: %s", external_odom_ ? "true" : "false");
++  RCLCPP_INFO(
++    this->get_logger(), "External odometry timeout: %.3f s", external_odom_timeout_s_);
+   RCLCPP_INFO(this->get_logger(), "FMU prefix: %s", fmu_prefix.c_str());
+ 
+   as2::frame::eulerToQuaternion(M_PI, 0.0, M_PI_2, q_ned_to_enu_);
+@@ -133,9 +140,6 @@ PixhawkPlatform::PixhawkPlatform(const rclcpp::NodeOptions & options)
+     fmu_prefix + "/fmu/in/vehicle_command", rclcpp::SensorDataQoS());
+   px4_visual_odometry_pub_ = this->create_publisher<px4_msgs::msg::VehicleOdometry>(
+     fmu_prefix + "/fmu/in/vehicle_visual_odometry", rclcpp::SensorDataQoS());
+-
+-  px4_manual_control_switches_pub_ = this->create_publisher<px4_msgs::msg::ManualControlSwitches>(
+-    fmu_prefix + "/fmu/in/manual_control_switches", rclcpp::SensorDataQoS());
+ }
+ 
+ void PixhawkPlatform::configureSensors()
+@@ -401,9 +405,24 @@ bool PixhawkPlatform::ownSendCommand()
+ void PixhawkPlatform::ownKillSwitch()
+ {
+   RCLCPP_ERROR(this->get_logger(), "KILL SWITCH TRIGGERED");
+-  px4_msgs::msg::ManualControlSwitches kill_switch_msg;
+-  kill_switch_msg.kill_switch = true;
+-  px4_manual_control_switches_pub_->publish(kill_switch_msg);
++  // The previous implementation published px4_msgs::msg::ManualControlSwitches with
++  // kill_switch = true on /fmu/in/manual_control_switches. That topic is NOT one of the
++  // uXRCE-DDS client subscriptions in PX4 v1.17 (see
++  // src/modules/uxrce_dds_client/dds_topics.yaml), so nothing on the FMU ever received it
++  // and the kill switch was a silent no-op.
++  //
++  // /fmu/in/vehicle_command IS a v1.17 subscription (and is already used by this platform
++  // for arm/disarm/offboard), so the kill is issued as a force-disarm VehicleCommand:
++  //   param1 = 0      -> disarm  (VehicleCommand::ARMING_ACTION_DISARM)
++  //   param2 = 21196  -> PX4 "force" magic number, which makes Commander skip the
++  //                      in-air / landed checks and cut the motors immediately.
++  // 21196 is a magic literal in PX4's Commander, it is not exported as a constant by
++  // px4_msgs 2.0.1's VehicleCommand.msg, hence the local constant below.
++  static constexpr float PX4_FORCE_DISARM_MAGIC = 21196.0f;
++  PX4publishVehicleCommand(
++    px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM,
++    static_cast<float>(px4_msgs::msg::VehicleCommand::ARMING_ACTION_DISARM),
++    PX4_FORCE_DISARM_MAGIC);
+ }
+ 
+ void PixhawkPlatform::ownStopPlatform() {RCLCPP_WARN(this->get_logger(), "NOT IMPLEMENTED");}
+@@ -427,10 +446,10 @@ void PixhawkPlatform::resetTrajectorySetpoint()
+ 
+ void PixhawkPlatform::resetAttitudeSetpoint()
+ {
+-  px4_attitude_setpoint_.pitch_body = NAN;
+-  px4_attitude_setpoint_.roll_body = NAN;
+-  px4_attitude_setpoint_.yaw_body = NAN;
+-
++  // px4_msgs 2.0.1 (PX4 v1.17) removed the Euler roll_body/pitch_body/yaw_body fields from
++  // VehicleAttitudeSetpoint; the setpoint is quaternion only. The three NAN assignments that
++  // used to be here were redundant: the commanded attitude is already written to q_d by
++  // ownSendCommand() right after this reset, so no conversion is needed.
+   px4_attitude_setpoint_.q_d = std::array<float, 4>{0, 0, 0, 1};
+   px4_attitude_setpoint_.thrust_body = std::array<float, 3>{0, 0, -min_thrust_};
+ }
+@@ -455,6 +474,12 @@ void PixhawkPlatform::externalOdomCb(const geometry_msgs::msg::TwistStamped::Sha
+     odometry_msg_.child_frame_id = twist_msg.header.frame_id;   // BODY_FRAME_FLU
+     odometry_msg_.pose.pose = pose_msg.pose;
+     odometry_msg_.twist.twist = twist_msg.twist;
++
++    // S3 staleness gate: stamp the arrival of a usable external odometry sample. This is
++    // deliberately inside the try block: if the TF lookup throws, odometry_msg_ keeps its
++    // previous (frozen) contents, which is exactly the condition the gate must catch.
++    last_external_odom_time_ = this->get_clock()->now();
++    external_odom_received_ = true;
+   } catch (tf2::TransformException & ex) {
+     RCLCPP_WARN(this->get_logger(), "Could not get transform: %s", ex.what());
+   }
+@@ -559,9 +584,47 @@ void PixhawkPlatform::PX4publishVehicleCommand(uint16_t command, float param1, f
+   px4_vehicle_command_pub_->publish(msg);
+ }
+ 
++/**
++ * @brief Report whether the external odometry source is still alive.
++ *
++ * The visual odometry timer re-stamps every message with now(), so a dead motion capture
++ * system would otherwise be invisible to PX4: it would keep receiving a frozen pose with
++ * fresh timestamps, consider the external vision healthy and run no failsafe.
++ */
++bool PixhawkPlatform::isExternalOdomFresh()
++{
++  bool fresh = false;
++  if (external_odom_received_) {
++    const double age = (this->get_clock()->now() - last_external_odom_time_).seconds();
++    fresh = (age >= 0.0) && (age < external_odom_timeout_s_);
++  }
++
++  // Edge triggered logging: one message per transition, never once per cycle.
++  if (!fresh && !external_odom_stale_) {
++    external_odom_stale_ = true;
++    RCLCPP_ERROR(
++      this->get_logger(),
++      "EXTERNAL ODOMETRY STALE (no sample for more than %.3f s): stopped publishing to "
++      "/fmu/in/vehicle_visual_odometry so PX4 can run its external vision failsafe",
++      external_odom_timeout_s_);
++  } else if (fresh && external_odom_stale_) {
++    external_odom_stale_ = false;
++    RCLCPP_INFO(
++      this->get_logger(),
++      "External odometry recovered: resuming /fmu/in/vehicle_visual_odometry");
++  }
++  return fresh;
++}
++
+ /// @brief See documentation: https://docs.px4.io/v1.13/en/msg_docs/vehicle_odometry.html
+ void PixhawkPlatform::PX4publishVisualOdometry()
+ {
++  // S3: never feed PX4 a stale pose. Stopping the stream (rather than publishing the last
++  // known pose, or a zeroed one) is what makes PX4 declare an external vision timeout.
++  if (!isExternalOdomFresh()) {
++    return;
++  }
++
+   // Position in meters. Frame of reference defined by local_frame
+   px4_visual_odometry_msg_.pose_frame = px4_msgs::msg::VehicleOdometry::POSE_FRAME_FRD;
+   // FLU --> FRD
+@@ -776,9 +839,15 @@ void PixhawkPlatform::px4GpsCallback(const px4_msgs::msg::SensorGps::SharedPtr m
+   }
+   nav_sat_fix_msg.status.service = sensor_msgs::msg::NavSatStatus::SERVICE_GPS;  // DEFAULT
+ 
+-  nav_sat_fix_msg.latitude = msg->lat;
+-  nav_sat_fix_msg.longitude = msg->lon;
+-  nav_sat_fix_msg.altitude = msg->alt_ellipsoid;
++  // px4_msgs 2.0.1 (PX4 v1.17) renamed and re-typed these SensorGps fields:
++  //   int32 lat            [1e-7 deg] -> float64 latitude_deg          [deg]
++  //   int32 lon            [1e-7 deg] -> float64 longitude_deg         [deg]
++  //   int32 alt_ellipsoid  [mm]       -> float64 altitude_ellipsoid_m  [m]
++  // They are already in the units sensor_msgs/NavSatFix expects, so the 1e7 / 1e3
++  // rescaling that used to follow has been removed.
++  nav_sat_fix_msg.latitude = msg->latitude_deg;
++  nav_sat_fix_msg.longitude = msg->longitude_deg;
++  nav_sat_fix_msg.altitude = msg->altitude_ellipsoid_m;
+ 
+   if (!std::isnan(msg->eph) && !std::isnan(msg->epv)) {
+     // Position uncertainty --> Diagonal known
+@@ -793,9 +862,6 @@ void PixhawkPlatform::px4GpsCallback(const px4_msgs::msg::SensorGps::SharedPtr m
+     nav_sat_fix_msg.position_covariance = {-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+     nav_sat_fix_msg.position_covariance_type = sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_UNKNOWN;
+   }
+-  nav_sat_fix_msg.latitude = nav_sat_fix_msg.latitude / 1e7;
+-  nav_sat_fix_msg.longitude = nav_sat_fix_msg.longitude / 1e7;
+-  nav_sat_fix_msg.altitude = nav_sat_fix_msg.altitude / 1e3;
+ 
+   gps_sensor_ptr_->updateData(nav_sat_fix_msg);
+ }
+@@ -812,7 +878,8 @@ void PixhawkPlatform::px4BatteryCallback(const px4_msgs::msg::BatteryStatus::Sha
+   battery_msg.current = msg->current_a;
+   battery_msg.charge = NAN;
+   battery_msg.capacity = msg->capacity;
+-  battery_msg.design_capacity = msg->design_capacity;
++  // battery_msg.design_capacity left at its default: BatteryStatus.design_capacity was
++  // removed in px4_msgs 2.0.1 (PX4 v1.17) and has no replacement field.
+   battery_msg.percentage = 100.0 * msg->remaining;
+   // TODO(miferco97): config file with battery settings
+   battery_msg.power_supply_status = sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_UNKNOWN;
+@@ -824,7 +891,8 @@ void PixhawkPlatform::px4BatteryCallback(const px4_msgs::msg::BatteryStatus::Sha
+   battery_msg.cell_voltage = {};
+   battery_msg.cell_temperature = {};
+   battery_msg.location = '0';
+-  battery_msg.serial_number = std::to_string(msg->serial_number);
++  // battery_msg.serial_number left at its default: BatteryStatus.serial_number was removed
++  // in px4_msgs 2.0.1 (PX4 v1.17) and has no replacement field.
+ 
+   if (msg->warning >= 0) {
+     RCLCPP_WARN_ONCE(this->get_logger(), "Battery warning #%d", msg->warning);
