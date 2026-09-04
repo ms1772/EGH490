@@ -299,15 +299,29 @@ def tilt_deg_from_quaternion(x: float, y: float, z: float, w: float) -> Optional
 
 
 def health_tracked(health: object, body: str) -> Optional[bool]:
-    """Read one body's tracked flag out of the bridge's /mocap/health JSON.
+    """Read one body's tracked flag out of a mocap health payload.
 
-    The bridge keys that payload by VRPN TRACKER name and carries the
-    rigid_body_name inside each entry, because Motive commonly streams numeric
-    ids. Match on rigid_body_name first -- that is what this guard and the
-    estimator both key on -- and fall back to the tracker key so an unmapped
-    rig still reports something. Anything unrecognisable is None (unknown),
-    never False: a guard that trips on a JSON parse is a guard that gets
-    switched off.
+    TWO producers publish health JSON, with different shapes, and this guard
+    must read either -- pointing it at the wrong one and silently getting
+    "unknown" forever would disable a trip condition without saying so:
+
+      /mocap/health          from vrpn_to_rigidbodies.py. NESTED: keyed by VRPN
+                             TRACKER name, carrying rigid_body_name inside each
+                             entry, because Motive commonly streams numeric ids.
+                             Covers every body at once. This is the default and
+                             the better source -- it reports what the mocap link
+                             is doing, upstream of any estimator.
+
+      /{ns}/mocap_health     from the as2_mocap_guarded plugin. FLAT, one drone,
+                             tracked at the top level. Reports what the ESTIMATOR
+                             ACCEPTED, so it also goes false on a rejected
+                             quaternion or a name miss -- strictly downstream
+                             information, useful as a cross-check.
+
+    Resolution order: rigid_body_name inside a nested entry, then the tracker
+    key, then a flat top-level payload. Anything unrecognisable is None
+    (unknown), never False: a guard that trips on a JSON parse is a guard that
+    gets switched off.
     """
     if not isinstance(health, dict):
         return None
@@ -320,6 +334,13 @@ def health_tracked(health: object, body: str) -> Optional[bool]:
     entry = health.get(body)
     if isinstance(entry, dict) and isinstance(entry.get("tracked"), bool):
         return bool(entry["tracked"])
+    # Flat per-drone schema. Only trust it when the payload either names this
+    # body or names no body at all -- a flat payload for a DIFFERENT drone must
+    # not answer for this one.
+    if isinstance(health.get("tracked"), bool):
+        named = health.get("rigid_body_name")
+        if named is None or str(named) == body:
+            return bool(health["tracked"])
     return None
 
 
