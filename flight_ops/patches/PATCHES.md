@@ -1,8 +1,9 @@
 # `as2_platform_pixhawk` patches for the O134 indoor rig
 
 This directory carries the local delta that makes `as2_platform_pixhawk` build and behave
-correctly against the software actually installed on the O134 ground station, plus two
-safety changes that are specific to flying in a netted 8 x 6 x 4 m indoor volume.
+correctly against the software actually installed on the O134 ground station and the PX4
+v1.17.0 firmware actually on the aircraft, plus two safety changes that are specific to
+flying in a netted 8 x 6 x 4 m indoor volume.
 
 | File | Purpose |
 | --- | --- |
@@ -386,6 +387,86 @@ Logging is strictly edge-triggered: exactly one `RCLCPP_ERROR` on entering stale
 
 ---
 
+## Change 7 — two topic names the firmware publishes with a `_v1` suffix
+
+**File:** `src/pixhawk_platform.cpp`, constructor (the `// declare PX4 subscribers` and
+`// declare PX4 publishers` blocks)
+
+**Was**
+
+```cpp
+px4_battery_sub_ = this->create_subscription<px4_msgs::msg::BatteryStatus>(
+  fmu_prefix + "/fmu/out/battery_status", rclcpp::SensorDataQoS(),
+  ...
+px4_vehicle_attitude_setpoint_pub_ =
+  this->create_publisher<px4_msgs::msg::VehicleAttitudeSetpoint>(
+  fmu_prefix + "/fmu/in/vehicle_attitude_setpoint", rclcpp::SensorDataQoS());
+```
+
+**Became**
+
+```cpp
+  fmu_prefix + "/fmu/out/battery_status_v1", rclcpp::SensorDataQoS(),
+  ...
+  fmu_prefix + "/fmu/in/vehicle_attitude_setpoint_v1", rclcpp::SensorDataQoS());
+```
+
+— the two string literals change and a comment above each records the measurement. Message
+types, QoS, callbacks and every other topic name are untouched.
+
+**Why.** PX4 v1.17 versions some of its uORB messages, and its uXRCE-DDS client publishes
+and subscribes those under a topic name carrying a `_v<N>` suffix. `battery_status` and
+`vehicle_attitude_setpoint` are both versioned in v1.17.0, so the aircraft offers
+`.../fmu/out/battery_status_v1` and `.../fmu/in/vehicle_attitude_setpoint_v1` and nothing
+under the base names. DDS matching is exact — a subscriber on `/uav_0/fmu/out/battery_status`
+and a publisher on `/uav_0/fmu/out/battery_status_v1` never pair — and an unmatched endpoint
+logs nothing. Both failures were therefore silent:
+
+* **Battery telemetry.** The subscription matched nothing, `px4BatteryCallback()` never ran,
+  and `/drone0/sensor_measurements/battery` never carried a message. Everything downstream
+  that watches battery voltage (the pre-flight gate, the run-sheet's per-flight voltage
+  record) was looking at an empty topic.
+* **ATTITUDE control mode.** `PX4publishAttitudeSetpoint()` published into a topic with no
+  subscriber; the FC saw only the accompanying `offboard_control_mode` heartbeat with
+  `attitude = true` and no setpoint behind it. The indoor flight plan does not use this mode
+  (POSITION / SPEED / TRAJECTORY all go through `trajectory_setpoint`, which is unversioned),
+  but the platform advertises it as supported, so it had to be either fixed or removed.
+
+**Measured evidence.** `ros2 topic list` on drone 0 with the agent up, PX4 v1.17.0,
+11 Sept 2026: 65 topics under `/uav_0/fmu/`, of which exactly eight carry `_v1`:
+
+```
+/uav_0/fmu/out/vehicle_status_v1
+/uav_0/fmu/out/vehicle_local_position_v1
+/uav_0/fmu/out/battery_status_v1
+/uav_0/fmu/out/home_position_v1
+/uav_0/fmu/out/arming_check_request_v1
+/uav_0/fmu/out/airspeed_validated_v1
+/uav_0/fmu/in/vehicle_attitude_setpoint_v1
+/uav_0/fmu/in/arming_check_reply_v1
+```
+
+The other 57 are unversioned. Of the eleven live `/fmu/` names in this platform, those two
+were the only mismatches; the nine flight-critical ones (`sensor_combined`,
+`vehicle_control_mode`, `vehicle_gps_position`, `vehicle_odometry`, `offboard_control_mode`,
+`trajectory_setpoint`, `vehicle_rates_setpoint`, `vehicle_command`,
+`vehicle_visual_odometry`) already matched.
+
+**How the wrong names got in, and the rule that follows.** The base names were taken from
+`PX4-Autopilot/v1.17.0/src/modules/uxrce_dds_client/dds_topics.yaml` — the same file Change 5
+was verified against — which lists `topic: /fmu/out/battery_status` and
+`topic: /fmu/in/vehicle_attitude_setpoint`. **That file only ever shows base names.** The
+suffix is derived from each message's `MESSAGE_VERSION` when the client is generated; it is
+not written in the yaml, so reading the yaml produces a confident, wrong answer for every
+versioned message and there is no way to tell from that file which ones they are. This class
+of mismatch must therefore always be settled by `ros2 topic list` on the hardware, with the
+agent up, against the firmware that is actually flashed — never from the PX4 source tree.
+`flight_ops/deploy/verify_jetson.sh --with-fmu` and `preflight_check.py`'s
+`DEFAULT_FMU_TOPICS` carry the measured names for the same reason, and run-sheet step G1.4
+captures the list every session so a firmware change surfaces before the platform is launched.
+
+---
+
 ## Verification performed
 
 **Build** — green, zero warnings:
@@ -438,6 +519,62 @@ and exactly two log lines across the whole run:
         /fmu/in/vehicle_visual_odometry so PX4 can run its external vision failsafe
 ```
 
+**Change 7 on the aircraft** — drone 0 (`jetsonorinnx`), PX4 v1.17.0 on USB power, props off,
+11 Sept 2026. Rebuilt on the Jetson with the same flags (`Finished <<< as2_platform_pixhawk
+[1min 32s]`, zero warnings; `px4_msgs` and `as2_mocap_guarded` not rebuilt). Then
+`MicroXRCEAgent udp4 -p 8888` and the platform node alone:
+
+```
+ros2 launch as2_platform_pixhawk pixhawk_launch.py namespace:=drone0 fmu_prefix:=/uav_0 external_odom:=false
+```
+
+Control mode stays UNSET, so `ownSendCommand()` returns before publishing anything and the
+visual-odometry timer is never created: the node only reads from the FC. Nothing armed, no
+vehicle command sent (the platform log has no arm / offboard / command line).
+
+```
+$ ros2 topic info -v /uav_0/fmu/out/battery_status_v1
+Type: px4_msgs/msg/BatteryStatus
+
+Publisher count: 1
+Node name: _CREATED_BY_BARE_DDS_APP_          # the FC, through the agent
+Node namespace: _CREATED_BY_BARE_DDS_APP_
+Endpoint type: PUBLISHER
+QoS profile: BEST_EFFORT / KEEP_LAST (1) / TRANSIENT_LOCAL
+
+Subscription count: 1
+Node name: platform
+Node namespace: /drone0
+Endpoint type: SUBSCRIPTION
+QoS profile: BEST_EFFORT / KEEP_LAST (5) / VOLATILE
+```
+
+```
+$ ros2 topic info -v /uav_0/fmu/in/vehicle_attitude_setpoint_v1
+Publisher count: 1      Node name: platform            Node namespace: /drone0
+Subscription count: 1   Node name: _CREATED_BY_BARE_DDS_APP_   # the FC
+```
+
+```
+$ ros2 topic info /uav_0/fmu/out/battery_status
+Unknown topic '/uav_0/fmu/out/battery_status'
+$ ros2 topic info /uav_0/fmu/in/vehicle_attitude_setpoint
+Unknown topic '/uav_0/fmu/in/vehicle_attitude_setpoint'
+```
+
+Both endpoints now pair with the firmware, and the base names have no endpoint on either
+side. The relay path through this node is live: `/uav_0/fmu/out/sensor_combined`
+(unversioned) reaches `/drone0/sensor_measurements/imu` at 99.9 Hz, `platform/info` runs at
+10 Hz.
+
+**Not closed on this bench: an actual `BatteryState` message.** `ros2 topic echo --once
+/drone0/sensor_measurements/battery` timed out (20 s). Measured with the agent alone and no
+platform node: the FC publishes **no samples** on `/uav_0/fmu/out/battery_status_v1` while on
+USB power — 0 samples in 40 s with the endpoint present, against 154 on `vehicle_status_v1`
+in the same window and 100 Hz on `sensor_combined` / `vehicle_odometry`. Nothing can reach the
+platform's subscriber until the FC has a battery to report on, so this is carried on the bench
+card below rather than claimed here.
+
 ## Not verified — needs the aircraft
 
 Everything below is reasoned from the PX4 v1.17.0 source and the message definitions, and has
@@ -462,3 +599,11 @@ card before the first armed flight:
 * **Battery fields.** `design_capacity` and `serial_number` are now always empty on
   `sensor_msgs/BatteryState`. Nothing in this stack was found to read them, but any downstream
   consumer or log analysis that did will now see defaults.
+* **Battery telemetry end to end (Change 7).** The subscriber now pairs with the FC's
+  `battery_status_v1` publisher, but on USB power the FC emits no `battery_status` samples at
+  all (0 in 40 s), so no `BatteryState` has yet been seen on
+  `/drone0/sensor_measurements/battery`. With a flight battery connected, props off:
+  `ros2 topic hz /uav_0/fmu/out/battery_status_v1` must show a rate, then
+  `ros2 topic echo --once /drone0/sensor_measurements/battery` must return a message with a
+  plausible `voltage`. Do this before the first armed flight — the pre-flight battery gate
+  reads that topic.
