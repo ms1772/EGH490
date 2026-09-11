@@ -970,6 +970,19 @@ phase_env() {
     </General>
     <Discovery>
       <ParticipantIndex>auto</ParticipantIndex>
+      <!-- Cyclone's default MaxAutoParticipantIndex is 9: at most TEN
+           participants (= ROS 2 processes, the ros2 daemon and every ros2
+           CLI tool included) per host per domain once ParticipantIndex is
+           auto. The drone stack is exactly ten (agent, daemon, platform,
+           estimator, controller, trajectory generator, four behaviours), so
+           whichever node loses the start-up race -- or any 'ros2 topic hz'
+           run alongside -- dies with "Failed to find a free participant
+           index for domain 0". Measured on drone0, 2026-09-11: Takeoff and
+           GoTo aborted at launch (exit -6); with 50, 8/8 nodes stayed up
+           for 35 min with CLI tools running. The ground station's
+           config_ground_station/cyclonedds_gs.xml uses the same value so
+           its unicast SPDP reaches every index this host may use. -->
+      <MaxAutoParticipantIndex>50</MaxAutoParticipantIndex>
       <Peers>${peers_xml}
       </Peers>
     </Discovery>

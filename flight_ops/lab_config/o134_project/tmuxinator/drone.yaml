@@ -31,6 +31,7 @@ sys_id      = @settings["target_system_id"]
 body        = @settings["rigid_body_name"]
 mocap_topic = @settings["mocap_topic"]
 log_level   = @settings["log_level"]
+middleware_env = @settings["middleware_env"]
 sim         = (mode == "sim")
 %>
 name: o134_<%= ns %>
@@ -39,7 +40,13 @@ startup_window: basics
 
 # `set +u` first: the ROS setup scripts dereference unset variables and abort
 # a strict shell. This is the same rule as everywhere else in flight_ops.
-pre_window: set +u && source /opt/ros/humble/setup.bash && source "<%= ws_setup %>" && export ROS_DOMAIN_ID=<%= domain_id %> && export O134_PROJECT="<%= project_dir %>" && export O134_REPO="<%= repo_root %>"
+#
+# `middleware_env` is the RMW_IMPLEMENTATION / CYCLONEDDS_URI fragment that
+# session_bringup.sh decided on. It is run in EVERY pane because the tmux
+# server's environment belongs to whoever created the server, not to the
+# launcher; without this a pane can come up on a different DDS config from
+# the one the launcher printed. See setup_middleware() in the launcher.
+pre_window: set +u && source /opt/ros/humble/setup.bash && source "<%= ws_setup %>" && export ROS_DOMAIN_ID=<%= domain_id %> && <%= middleware_env %> && export O134_PROJECT="<%= project_dir %>" && export O134_REPO="<%= repo_root %>"
 
 windows:
 

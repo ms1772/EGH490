@@ -33,7 +33,9 @@
 #
 #   flight_ops/session_bringup.sh --sim
 #   flight_ops/session_bringup.sh --sim --drones drone0,drone1,drone2
-#   flight_ops/session_bringup.sh --hardware --drones drone0 --guard-arm
+#   flight_ops/session_bringup.sh --hardware --role drone --drones drone0     # on the Jetson
+#   flight_ops/session_bringup.sh --hardware --role ground --drones drone0 \
+#         --mocap-server <motive-ip> --jetson-peer <jetson-ip> --guard-arm    # on the GS
 #   flight_ops/session_bringup.sh --stop
 #
 # Run --help for the full flag list.
@@ -66,6 +68,12 @@ ROS_SETUP="${ROS_SETUP:-/opt/ros/humble/setup.bash}"
 SESSION_PREFIX="o134_"
 GROUND_SESSION="${SESSION_PREFIX}ground"
 
+# Ground-station Cyclone DDS configuration for hardware mode, and the session
+# copy the launcher renders from it (interface + peers rewritten from flags).
+# The copy lives in /tmp so a second shell can export the identical URI.
+GS_CYCLONE_XML="${PROJECT_DIR}/config_ground_station/cyclonedds_gs.xml"
+RENDERED_CYCLONE_XML="/tmp/o134_cyclonedds_gs.xml"
+
 # --------------------------------------------------------------------------
 # defaults
 # --------------------------------------------------------------------------
@@ -82,6 +90,15 @@ SETTLE_S="12"
 ATTACH="false"
 PRINT_PLAN="false"
 PREFLIGHT_EXTRA=()
+
+# DDS, hardware mode, ground role. See setup_middleware() for the rules.
+CYCLONE_CONFIG=""            # "" = auto, "none" = leave the environment alone, or a file
+GS_IFACE="eth1"              # the GS's fleet interface (WSL2 mirrored: the laptop's wifi)
+# THE JETSON ADDRESS IS A DHCP LEASE. 10.88.38.136 is what jetsonorinnx
+# (drone0) held on 2026-09-11 and it is the value cyclonedds_gs.xml ships
+# with. When the lease moves, pass --jetson-peer; do not edit files in O-134.
+JETSON_PEERS_CSV="10.88.38.136"
+RMW="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
 
 # --------------------------------------------------------------------------
 # output helpers -- a lab script that mumbles is a lab script nobody reads
@@ -161,6 +178,28 @@ PLUMBING
                         Default: leave the sessions detached and return.
   --print-plan          Print every command that would be run, then exit.
 
+DDS (hardware mode, ground role -- the GS side of the wifi link)
+  --jetson-peer IPS     Comma-separated addresses of the aircraft, written
+                        into the Cyclone Peers block for this session.
+                        Default 10.88.38.136 (drone0's DHCP lease on
+                        2026-09-11 -- check it on the day: `hostname -I`
+                        on the Jetson). A wrong peer degrades discovery to
+                        multicast-only, which on this wifi means 0 topics.
+  --gs-iface IFACE      The GS interface Cyclone is pinned to. Default eth1
+                        (the laptop's wifi as WSL2 mirrored networking
+                        presents it). Refused if the interface does not
+                        exist.
+  --cyclone-config X    FILE: render the session copy from this file instead
+                        of lab_config/o134_project/config_ground_station/
+                        cyclonedds_gs.xml.  none: do not touch CYCLONEDDS_URI
+                        at all (the panes inherit this shell's value).
+                        Default: the project file in --hardware for the
+                        ground/all roles; `none` for --sim and for the drone
+                        role, where ~/as2_o134_ws/setup_env.sh already
+                        points at the Jetson's own cyclonedds.xml (and if it
+                        is unset there, that file is used directly rather
+                        than Cyclone's defaults).
+
 TEARDOWN
   --stop                Tear down every o134_* tmux session and exit.
                         Equivalent to flight_ops/session_stop.sh.
@@ -204,6 +243,12 @@ while [[ $# -gt 0 ]]; do
     --settle)         SETTLE_S="${2:?--settle needs a value}"; shift ;;
     --settle=*)       SETTLE_S="${1#*=}" ;;
     --preflight-arg)  PREFLIGHT_EXTRA+=("${2:?--preflight-arg needs a value}"); shift ;;
+    --jetson-peer)    JETSON_PEERS_CSV="${2:?--jetson-peer needs a value}"; shift ;;
+    --jetson-peer=*)  JETSON_PEERS_CSV="${1#*=}" ;;
+    --gs-iface)       GS_IFACE="${2:?--gs-iface needs a value}"; shift ;;
+    --gs-iface=*)     GS_IFACE="${1#*=}" ;;
+    --cyclone-config) CYCLONE_CONFIG="${2:?--cyclone-config needs a value}"; shift ;;
+    --cyclone-config=*) CYCLONE_CONFIG="${1#*=}" ;;
     --attach)         ATTACH="true" ;;
     --print-plan)     PRINT_PLAN="true" ;;
     --stop)           exec "${STOP_SCRIPT}" ;;
@@ -330,6 +375,148 @@ source_ros() {
 require_pkg() {
   ros2 pkg prefix "$1" >/dev/null 2>&1 \
     || die "ROS 2 package '$1' is not on AMENT_PREFIX_PATH. ${2:-}"
+}
+
+# --------------------------------------------------------------------------
+# middleware -- which Cyclone config every pane runs under, decided ONCE here
+# --------------------------------------------------------------------------
+# WHY THE LAUNCHER OWNS THIS
+#
+# The tmux server's global environment is what every pane inherits, and it is
+# set by whichever process happened to create the server -- this script,
+# deploy/mocap_bringup.sh, or a crew member's `tmux` an hour earlier. So the
+# panes' RMW_IMPLEMENTATION and CYCLONEDDS_URI are NOT reliably this shell's.
+# The launcher therefore computes MIDDLEWARE_ENV, a shell fragment, and both
+# tmuxinator projects run it in pre_window: the panes see exactly what this
+# shell decided, whoever started the server.
+#
+# THE RULES
+#   --hardware, role ground/all   render lab_config/.../cyclonedds_gs.xml to
+#                                 /tmp/o134_cyclonedds_gs.xml with --gs-iface
+#                                 and --jetson-peer applied, export it.
+#                                 (Measured 2026-09-11: without DontRoute the
+#                                 GS sees 0-1 of the 65 /uav_0/fmu topics.)
+#   --hardware, role drone        inherit. ~/as2_o134_ws/setup_env.sh has
+#                                 already pointed CYCLONEDDS_URI at the
+#                                 Jetson's own cyclonedds.xml; if the shell
+#                                 never sourced it, use that file directly.
+#   --sim                         inherit. Rig R1 is one box; the default
+#                                 Cyclone config is right for it and a pinned
+#                                 interface that is down would refuse to start.
+#   --cyclone-config FILE|none    overrides the above.
+MIDDLEWARE_ENV=""
+MIDDLEWARE_NOTE=""
+
+render_cyclone_config() {
+  # $1 = source xml, $2 = destination. Rewrites the interface pin and the
+  # Peers block; everything else (DontRoute, the participant cap, the
+  # comments) is carried verbatim so the session copy reads like the source.
+  python3 - "$1" "$2" "${GS_IFACE}" "${JETSON_PEERS_CSV}" "${MODE} ${ROLE}" <<'PY'
+import datetime, re, sys
+src, dst, iface, peers_csv, context = sys.argv[1:6]
+peers = [p.strip() for p in peers_csv.split(",") if p.strip()]
+if not peers:
+    sys.exit("--jetson-peer resolved to an empty list")
+for p in peers:
+    if not re.fullmatch(r"[A-Za-z0-9._:-]+", p):
+        sys.exit("--jetson-peer '%s' does not look like an address" % p)
+if not re.fullmatch(r"[A-Za-z0-9._-]+", iface):
+    sys.exit("--gs-iface '%s' does not look like an interface name" % iface)
+with open(src, "r", encoding="utf-8") as fh:
+    text = fh.read()
+n = len(re.findall(r'<NetworkInterface\s+name="[^"]*"', text))
+if n != 1:
+    sys.exit("%s: expected exactly one <NetworkInterface name=...>, found %d" % (src, n))
+text = re.sub(r'(<NetworkInterface\s+name=")[^"]*(")',
+              lambda m: m.group(1) + iface + m.group(2), text)
+peers_xml = ("<Peers>\n" + "".join('        <Peer address="%s"/>\n' % p for p in peers)
+             + "      </Peers>")
+text, n = re.subn(r"<Peers>.*?</Peers>", peers_xml, text, flags=re.S)
+if n != 1:
+    sys.exit("%s: expected exactly one <Peers> block, found %d" % (src, n))
+stamp = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+header = ("<!-- SESSION COPY rendered %s by session_bringup.sh (%s)\n"
+          "     from %s\n"
+          "     interface %s; peers %s.\n"
+          "     Do not edit: change the source or the launcher flags. -->\n"
+          % (stamp, context, src, iface, ", ".join(peers)))
+lines = text.split("\n", 1)
+if lines[0].startswith("<?xml"):
+    text = lines[0] + "\n" + header + (lines[1] if len(lines) > 1 else "")
+else:
+    text = header + text
+with open(dst, "w", encoding="utf-8") as fh:
+    fh.write(text)
+PY
+}
+
+setup_middleware() {
+  local source_xml="" uri=""
+  case "${CYCLONE_CONFIG}" in
+    none) source_xml="" ;;
+    "")   if [[ "${MODE}" == "hardware" && "${ROLE}" != "drone" ]]; then source_xml="${GS_CYCLONE_XML}"; fi ;;
+    *)    source_xml="${CYCLONE_CONFIG}" ;;
+  esac
+
+  if [[ -n "${source_xml}" ]]; then
+    [[ -f "${source_xml}" ]] || die "Cyclone config not found: ${source_xml}"
+    if ! ip -brief link show "${GS_IFACE}" >/dev/null 2>&1; then
+      die "--gs-iface ${GS_IFACE} does not exist on this machine. Interfaces: $(ip -brief link show 2>/dev/null | awk '{print $1}' | tr '\n' ' ')
+Cyclone pinned to a missing interface refuses to create a single participant."
+    fi
+    render_cyclone_config "${source_xml}" "${RENDERED_CYCLONE_XML}" \
+      || die "could not render ${source_xml} (see the message above)"
+    uri="file://${RENDERED_CYCLONE_XML}"
+    export CYCLONEDDS_URI="${uri}"
+    MIDDLEWARE_NOTE="rendered from ${source_xml}: iface ${GS_IFACE}, peers ${JETSON_PEERS_CSV}"
+  else
+    uri="${CYCLONEDDS_URI:-}"
+    if [[ -z "${uri}" && "${MODE}" == "hardware" && -f "${AS2_WS}/cyclonedds.xml" ]]; then
+      # A Jetson whose operator did not `source setup_env.sh`. The file
+      # jetson_setup.sh wrote is right there; Cyclone's defaults are not
+      # (they may bind the FC link, and cap the host at ten participants).
+      uri="file://${AS2_WS}/cyclonedds.xml"
+      export CYCLONEDDS_URI="${uri}"
+      warn "CYCLONEDDS_URI was unset; using ${uri} (source ${AS2_WS}/setup_env.sh next time)"
+      MIDDLEWARE_NOTE="${AS2_WS}/cyclonedds.xml (CYCLONEDDS_URI was unset in this shell)"
+    else
+      MIDDLEWARE_NOTE="inherited from this shell (${uri:-CYCLONEDDS_URI unset -> Cyclone defaults})"
+    fi
+  fi
+  export RMW_IMPLEMENTATION="${RMW}"
+
+  # The fragment the panes run. Single-quoted so a path survives the trip
+  # through tmux send-keys and an interactive shell; a quote in the value
+  # would break that, so refuse one rather than ship a broken pre_window.
+  [[ "${uri}" != *"'"* && "${RMW}" != *"'"* ]] || die "CYCLONEDDS_URI / RMW_IMPLEMENTATION must not contain a single quote"
+  MIDDLEWARE_ENV="export RMW_IMPLEMENTATION='${RMW}'"
+  if [[ -n "${uri}" ]]; then
+    MIDDLEWARE_ENV+=" && export CYCLONEDDS_URI='${uri}'"
+  else
+    # Explicit, so a stale value in the tmux server's environment (left by
+    # whoever created the server) cannot leak into the panes.
+    MIDDLEWARE_ENV+=" && unset CYCLONEDDS_URI"
+  fi
+
+  # The ros2 CLI daemon caches the graph under the environment it was started
+  # with. Restart it under this one so `ros2 topic list` in the crew's shell
+  # shows the fleet the panes see. (hz/echo build their own node and need the
+  # same export in that shell -- printed below.)
+  if [[ -n "${source_xml}" && "${PRINT_PLAN}" != "true" ]]; then
+    ros2 daemon stop >/dev/null 2>&1 || true
+    ros2 daemon start >/dev/null 2>&1 || true
+  fi
+}
+
+print_middleware() {
+  rule
+  say "  RMW_IMPLEMENTATION  ${RMW}"
+  say "  CYCLONEDDS_URI      ${CYCLONEDDS_URI:-<unset>}"
+  say "  cyclone config      ${MIDDLEWARE_NOTE}"
+  if [[ "${CYCLONEDDS_URI:-}" == "file://${RENDERED_CYCLONE_XML}" ]]; then
+    say "  other shells        export CYCLONEDDS_URI=${CYCLONEDDS_URI}; ros2 daemon stop; ros2 daemon start"
+  fi
+  rule
 }
 
 # --------------------------------------------------------------------------
@@ -518,6 +705,7 @@ start_drone_session() {
     "repo_root=${REPO_ROOT}"
     "ws_setup=${AS2_WS}/install/setup.bash"
     "ros_domain_id=${DOMAIN_ID}"
+    "middleware_env=${MIDDLEWARE_ENV}"
     "fmu_prefix=${DRONE_FMU[$i]}"
     "target_system_id=${DRONE_SYS[$i]}"
     "rigid_body_name=${DRONE_BODY[$i]}"
@@ -538,6 +726,7 @@ start_ground_session() {
     "repo_root=${REPO_ROOT}"
     "ws_setup=${AS2_WS}/install/setup.bash"
     "ros_domain_id=${DOMAIN_ID}"
+    "middleware_env=${MIDDLEWARE_ENV}"
     "guard_args=${GUARD_ARGS}"
     "guard_ros_args=${GUARD_ROS_ARGS}"
     "mocap_bodies=${mocap_bodies}"
@@ -613,6 +802,8 @@ fi
 # Environment before anything that needs ros2 on PATH.
 source_ros
 info "ROS 2 sourced; ROS_DOMAIN_ID=${ROS_DOMAIN_ID}"
+setup_middleware
+print_middleware
 
 command -v tmux >/dev/null 2>&1 || die "tmux is not installed"
 command -v tmuxinator >/dev/null 2>&1 || die "tmuxinator is not installed"

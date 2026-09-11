@@ -38,6 +38,7 @@ domain_id   = @settings["ros_domain_id"]
 guard_args  = @settings["guard_args"]
 guard_ros_args = @settings["guard_ros_args"]
 mocap_bodies = @settings["mocap_bodies"]
+middleware_env = @settings["middleware_env"]
 rviz        = @settings["rviz"] == "true"
 viewer      = @settings["viewer"] == "true"
 sim         = (mode == "sim")
@@ -46,7 +47,13 @@ name: o134_ground
 attach: false
 startup_window: safety
 
-pre_window: set +u && source /opt/ros/humble/setup.bash && source "<%= ws_setup %>" && export ROS_DOMAIN_ID=<%= domain_id %> && export O134_PROJECT="<%= project_dir %>" && export O134_REPO="<%= repo_root %>"
+# `middleware_env` -- RMW_IMPLEMENTATION and CYCLONEDDS_URI as decided by
+# session_bringup.sh -- runs in every pane, because the tmux server's
+# environment is whoever created the server's, not the launcher's. In
+# --hardware this is what puts the guard on the pinned, DontRoute'd Cyclone
+# config that can actually see the aircraft (see config_ground_station/
+# cyclonedds_gs.xml); a guard on the default config sees no FC at all.
+pre_window: set +u && source /opt/ros/humble/setup.bash && source "<%= ws_setup %>" && export ROS_DOMAIN_ID=<%= domain_id %> && <%= middleware_env %> && export O134_PROJECT="<%= project_dir %>" && export O134_REPO="<%= repo_root %>"
 
 windows:
 
