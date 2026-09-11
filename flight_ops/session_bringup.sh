@@ -107,6 +107,11 @@ MOCAP_TRACKERS=""            # Motive rigid-body names; default: drones.yaml rig
 GUARD_FEED_MIN_HZ="50"
 GUARD_FEED_WINDOW_S="3"
 
+# The uXRCE-DDS agent (hardware mode, drone/all roles). See setup_xrce_agent().
+XRCE_PORT="8888"             # UXRCE_DDS_PRT on the FC; gated in expected_state.yaml
+XRCE_AGENT="MicroXRCEAgent"  # resolved from PATH unless a path is given
+FMU_WAIT_S="20"              # post-launch: how long /<fmu_prefix>/fmu/out/vehicle_odometry may take to appear
+
 # DDS, hardware mode, ground role. See setup_middleware() for the rules.
 CYCLONE_CONFIG=""            # "" = auto, "none" = leave the environment alone, or a file
 GS_IFACE="eth1"              # the GS's fleet interface (WSL2 mirrored: the laptop's wifi)
@@ -226,6 +231,20 @@ PLUMBING
                         is always the latter there. Same files, same panes;
                         parity is checked by tmux_project.py --self-test.
 
+FLIGHT CONTROLLER LINK (hardware mode, drone/all roles -- the aircraft side)
+  --xrce-port N         UDP port the uXRCE-DDS agent listens on. Default 8888
+                        (= UXRCE_DDS_PRT on the FC). The launcher starts
+                        `MicroXRCEAgent udp4 -p N` as the first window of the
+                        drone session -- nothing under /<fmu_prefix>/fmu/
+                        exists until the FC has dialled an agent. If udp/N is
+                        already bound by a running agent it is REUSED, said
+                        so, and left alone by --stop. If the port is free and
+                        the agent binary is not on PATH the launcher refuses.
+                        Measured 2026-09-11: without this, 8/8 nodes up and
+                        the platform publishing visual odometry into nothing.
+  --xrce-agent BIN      The agent binary. Default MicroXRCEAgent from PATH;
+                        a path is accepted. No whitespace or quotes.
+
 DDS (hardware mode, ground role -- the GS side of the wifi link)
   --jetson-peer IPS     Comma-separated addresses of the aircraft, written
                         into the Cyclone Peers block for this session.
@@ -297,6 +316,10 @@ while [[ $# -gt 0 ]]; do
     --settle)         SETTLE_S="${2:?--settle needs a value}"; shift ;;
     --settle=*)       SETTLE_S="${1#*=}" ;;
     --preflight-arg)  PREFLIGHT_EXTRA+=("${2:?--preflight-arg needs a value}"); shift ;;
+    --xrce-port)      XRCE_PORT="${2:?--xrce-port needs a value}"; shift ;;
+    --xrce-port=*)    XRCE_PORT="${1#*=}" ;;
+    --xrce-agent)     XRCE_AGENT="${2:?--xrce-agent needs a value}"; shift ;;
+    --xrce-agent=*)   XRCE_AGENT="${1#*=}" ;;
     --jetson-peer)    JETSON_PEERS_CSV="${2:?--jetson-peer needs a value}"; shift ;;
     --jetson-peer=*)  JETSON_PEERS_CSV="${1#*=}" ;;
     --gs-iface)       GS_IFACE="${2:?--gs-iface needs a value}"; shift ;;
@@ -334,6 +357,9 @@ esac
 [[ -d "${TMUXINATOR_DIR}" ]] || die "missing ${TMUXINATOR_DIR}"
 [[ -f "${PREFLIGHT}" ]] || die "missing ${PREFLIGHT}"
 [[ -f "${TMUX_PROJECT_PY}" ]] || die "missing ${TMUX_PROJECT_PY}"
+
+[[ "${XRCE_PORT}" =~ ^[0-9]+$ && "${XRCE_PORT}" -ge 1 && "${XRCE_PORT}" -le 65535 ]] || die "--xrce-port must be a UDP port number (got '${XRCE_PORT}')"
+[[ -n "${XRCE_AGENT}" && "${XRCE_AGENT}" != *[[:space:]\'\"]* ]] || die "--xrce-agent must be a bare binary name or path with no whitespace or quotes (got '${XRCE_AGENT}')"
 
 if [[ -n "${MOCAP_SERVER}" ]]; then
   [[ "${MODE}" == "hardware" ]] || die "--mocap-server is for --hardware only. In --sim, fake_mocap.py publishes /mocap/rigid_bodies from inside the ground session."
@@ -585,7 +611,96 @@ print_middleware() {
   if [[ "${CYCLONEDDS_URI:-}" == "file://${RENDERED_CYCLONE_XML}" ]]; then
     say "  other shells        export CYCLONEDDS_URI=${CYCLONEDDS_URI}; ros2 daemon stop; ros2 daemon start"
   fi
+  if [[ "${XRCE_MODE}" != "n/a" ]]; then
+    say "  uXRCE-DDS agent     ${XRCE_NOTE}"
+  fi
   rule
+}
+
+# --------------------------------------------------------------------------
+# the uXRCE-DDS agent -- the flight controller's only way into ROS 2
+# --------------------------------------------------------------------------
+# WHY THE LAUNCHER STARTS IT
+#
+# PX4's uxrce_dds_client dials an agent (UXRCE_DDS_AG_IP:UXRCE_DDS_PRT, the
+# Jetson end of the point-to-point FC link, udp/8888). Until that session is
+# up there is NOTHING under /<fmu_prefix>/fmu/: the platform starts cleanly,
+# publishes vehicle_visual_odometry into the void, and reports connected
+# forever. 2026-09-11 cold-boot rehearsal: `--hardware --role drone` brought
+# up 8/8 nodes and no FC data, because every earlier test had started the
+# agent by hand first. So the agent is part of the drone session -- window
+# `agent`, first -- via drone.yaml, and therefore identically through
+# tmuxinator and tmux_project.py.
+#
+# THE RULES (hardware mode, roles drone and all; sim has no FC)
+#   udp/PORT already bound by a running agent   reuse it. Say so. The session
+#                                               gets no agent window and
+#                                               session_stop.sh leaves it.
+#   udp/PORT bound by something else            refuse: the agent could not
+#                                               bind it either.
+#   udp/PORT free, binary on PATH               start it: first window of the
+#                                               FIRST drone session (one
+#                                               agent serves every FC).
+#   udp/PORT free, binary missing               refuse. An FC with nothing to
+#                                               dial is not a flyable state.
+XRCE_MODE="n/a"              # n/a | start | reuse
+XRCE_NOTE=""
+XRCE_BIN=""
+
+xrce_port_bound() {
+  # 0 if some socket is bound to udp/XRCE_PORT (any address, v4 or v6).
+  # ss needs no privileges for this; /proc/net/udp is the fallback.
+  if command -v ss >/dev/null 2>&1; then
+    [[ -n "$(ss -H -uan "sport = :${XRCE_PORT}" 2>/dev/null)" ]]
+  else
+    local hex; hex="$(printf '%04X' "${XRCE_PORT}")"
+    grep -qsE "^ *[0-9]+: [0-9A-F]+:${hex} " /proc/net/udp /proc/net/udp6
+  fi
+}
+
+xrce_port_holder() {
+  # "pid=N,comm" of the process holding udp/XRCE_PORT, if ss can see it
+  # (own processes without sudo; others only with). Empty when unknown.
+  command -v ss >/dev/null 2>&1 || return 0
+  ss -H -uanp "sport = :${XRCE_PORT}" 2>/dev/null \
+    | sed -n 's/.*users:(("\([^"]*\)",pid=\([0-9]*\).*/pid=\2,\1/p' | head -1
+}
+
+xrce_agent_pids() {
+  # pgrep exits 1 on no match; under pipefail that would abort the launcher.
+  local out; out="$(pgrep -x "$(basename "${XRCE_AGENT}")" 2>/dev/null || true)"
+  printf '%s' "${out}" | tr '\n' ' ' | sed 's/ $//'
+}
+
+setup_xrce_agent() {
+  [[ "${MODE}" == "hardware" && "${ROLE}" != "ground" ]] || return 0
+  local holder pids
+  if xrce_port_bound; then
+    holder="$(xrce_port_holder)"
+    pids="$(xrce_agent_pids)"
+    if [[ "${holder}" == *",$(basename "${XRCE_AGENT}")"* || -n "${pids}" ]]; then
+      XRCE_MODE="reuse"
+      XRCE_NOTE="udp/${XRCE_PORT} is already bound by a running $(basename "${XRCE_AGENT}") (${holder:-pid ${pids}}) -- REUSING it, not starting a second one. It was not started by this launcher; --stop leaves it running."
+      info "uXRCE-DDS agent: ${XRCE_NOTE}"
+    else
+      die "udp/${XRCE_PORT} is already bound${holder:+ by ${holder}} and no $(basename "${XRCE_AGENT}") process is visible.
+The agent would fail to bind it too. Find the holder (ss -uanp 'sport = :${XRCE_PORT}'),
+stop it, or pass --xrce-port N to match UXRCE_DDS_PRT on the FC."
+    fi
+  else
+    XRCE_BIN="$(command -v "${XRCE_AGENT}" 2>/dev/null || true)"
+    if [[ -z "${XRCE_BIN}" || ! -x "${XRCE_BIN}" ]]; then
+      die "hardware mode needs the uXRCE-DDS agent and '${XRCE_AGENT}' is not on PATH (or not executable).
+udp/${XRCE_PORT} is free, so no agent is running either: the flight controller would have
+nothing to dial and /<fmu_prefix>/fmu/ would never appear. On a Jetson:
+    source ${AS2_WS}/setup_env.sh          (puts ~/xrce_agent/bin on PATH)
+    deploy/jetson_setup.sh --only agent   (builds it if it is missing)
+or pass --xrce-agent /path/to/MicroXRCEAgent."
+    fi
+    XRCE_MODE="start"
+    XRCE_NOTE="udp/${XRCE_PORT} is free; starting ${XRCE_BIN} udp4 -p ${XRCE_PORT} as window 'agent' of ${SESSION_PREFIX}${DRONE_NS[0]} (stopped by --stop)"
+    info "uXRCE-DDS agent: ${XRCE_NOTE}"
+  fi
 }
 
 # --------------------------------------------------------------------------
@@ -899,6 +1014,75 @@ run_post_gate() {
 }
 
 # --------------------------------------------------------------------------
+# post-launch: is the flight controller actually talking?
+# --------------------------------------------------------------------------
+# The agent being up is necessary, not sufficient: the FC still has to dial
+# it (UXRCE_DDS_CFG/AG_IP/PRT/KEY/DOM_ID, and the link itself) and land its
+# topics under the prefix drones.yaml says (UXRCE_DDS_NS_IDX). So after the
+# sessions are up, wait up to FMU_WAIT_S for a PUBLISHER on
+# <fmu_prefix>/fmu/out/vehicle_odometry -- the topic the platform's odometry
+# path lives on -- and count the <fmu_prefix>/fmu topics. Zero is the
+# 2026-09-11 failure exactly, and it is shouted, not summarised.
+#
+# `ros2 topic list/info` go through the CLI daemon, which answers before its
+# discovery has finished when it was just started (verify_jetson.sh hit the
+# same thing), hence a poll and not a single sample.
+FMU_RESULT=()                # one line per drone, for the final summary
+FMU_MISSING=0
+
+fmu_publishers() {  # $1 = topic -> publisher count (0 when unknown)
+  local out n
+  out="$(ros2 topic info "$1" 2>/dev/null || true)"   # exits 1 for an unknown topic
+  n="$(printf '%s\n' "${out}" | awk '/^Publisher count:/ {print $3}')"
+  printf '%s' "${n:-0}"
+}
+
+fmu_topic_count() {  # $1 = prefix -> number of <prefix>/fmu topics
+  ros2 topic list 2>/dev/null | grep -c "^$1/fmu" || true
+}
+
+wait_for_fmu() {
+  [[ "${MODE}" == "hardware" && "${ROLE}" != "ground" ]] || return 0
+  local i prefix topic t0 pubs=0 count agent_hint
+  for i in "${!DRONE_NS[@]}"; do
+    prefix="${DRONE_FMU[$i]}"; topic="${prefix}/fmu/out/vehicle_odometry"
+    info "${DRONE_NS[$i]}: waiting up to ${FMU_WAIT_S} s for a publisher on ${topic}"
+    t0=${SECONDS}; pubs=0
+    while (( SECONDS - t0 < FMU_WAIT_S )); do
+      pubs="$(fmu_publishers "${topic}")"
+      [[ "${pubs}" -ge 1 ]] && break
+      sleep 1
+    done
+    count="$(fmu_topic_count "${prefix}")"
+    if [[ "${pubs}" -ge 1 ]]; then
+      FMU_RESULT+=("${DRONE_NS[$i]} ${prefix}: ${count} ${prefix}/fmu topics, vehicle_odometry publishers=${pubs} after $((SECONDS - t0)) s")
+      good "${FMU_RESULT[-1]}"
+    else
+      FMU_MISSING=$((FMU_MISSING + 1))
+      FMU_RESULT+=("${DRONE_NS[$i]} ${prefix}: NO FLIGHT CONTROLLER DATA -- ${count} ${prefix}/fmu topics, vehicle_odometry publishers=0 after ${FMU_WAIT_S} s")
+      if [[ "${XRCE_MODE}" == "reuse" ]]; then
+        agent_hint="The agent in use was NOT started here (${XRCE_NOTE%% --*})."
+      else
+        agent_hint="Started here: ${XRCE_BIN} udp4 -p ${XRCE_PORT}."
+      fi
+      loud_banner "${C_RED}" \
+        "NO FLIGHT CONTROLLER DATA FOR ${DRONE_NS[$i]}" \
+        "" \
+        "${count} topics under ${prefix}/fmu and no publisher on" \
+        "${topic} after ${FMU_WAIT_S} s." \
+        "The platform is publishing visual odometry into nothing and" \
+        "PX4 is not being fed. Check, in this order:" \
+        "  1. the agent pane:  tmux attach -t ${SESSION_PREFIX}${DRONE_NS[0]}   (window: agent)" \
+        "     -- it must say 'session established'. ${agent_hint}" \
+        "  2. the FC link:  ping -c 3 \${O134_FC_IP:-10.41.10.2}   FC powered? UXRCE_DDS_CFG=1000?" \
+        "  3. UXRCE_DDS_NS_IDX on the FC vs fmu_prefix ${prefix} in drones.yaml:" \
+        "     ros2 topic list | grep /fmu/   -- topics under a different prefix = that." \
+        "  4. deploy/verify_jetson.sh --drone-ns ${DRONE_NS[$i]} --with-fmu" >&2
+    fi
+  done
+}
+
+# --------------------------------------------------------------------------
 # tmux
 # --------------------------------------------------------------------------
 # WHICH PROGRAM TURNS A PROJECT FILE INTO A SESSION
@@ -944,9 +1128,17 @@ like a hardware fault. Tear the old one down first:
 
 start_drone_session() {
   local i="$1" ns="${DRONE_NS[$i]}" session="${SESSION_PREFIX}${DRONE_NS[$i]}"
+  # One agent serves every flight controller that dials this host, so only
+  # the first drone session carries the agent window (and only when the
+  # pre-launch check decided to start one).
+  local start_agent="false"
+  [[ "${XRCE_MODE}" == "start" && "${i}" -eq 0 ]] && start_agent="true"
   local cmd=("${RUNNER[@]}" -n "${session}" -p "${TMUXINATOR_DIR}/drone.yaml"
     "drone_namespace=${ns}"
     "mode=${MODE}"
+    "start_xrce_agent=${start_agent}"
+    "xrce_agent=${XRCE_BIN:-${XRCE_AGENT}}"
+    "xrce_port=${XRCE_PORT}"
     "project_dir=${PROJECT_DIR}"
     "repo_root=${REPO_ROOT}"
     "ws_setup=${AS2_WS}/install/setup.bash"
@@ -1049,6 +1241,7 @@ fi
 source_ros
 info "ROS 2 sourced; ROS_DOMAIN_ID=${ROS_DOMAIN_ID}"
 setup_middleware
+setup_xrce_agent
 print_middleware
 
 command -v tmux >/dev/null 2>&1 || die "tmux is not installed"
@@ -1091,6 +1284,10 @@ fi
 if [[ "${PRINT_PLAN}" == "true" ]]; then
   say ""
   say "Commands that would be run:"
+  case "${XRCE_MODE}" in
+    start) say "  [agent] ${XRCE_BIN} udp4 -p ${XRCE_PORT}   (window 'agent' of ${SESSION_PREFIX}${DRONE_NS[0]}, via drone.yaml)" ;;
+    reuse) say "  [agent] none -- ${XRCE_NOTE%% --*}" ;;
+  esac
   if [[ -n "${MOCAP_SERVER}" ]]; then
     [[ "${ROLE}" == "ground" ]] || for i in "${!DRONE_NS[@]}"; do say "  $(mocap_cmd_drone "${i}")"; done
     [[ "${ROLE}" == "drone" ]] || say "  $(mocap_cmd_ground)"
@@ -1122,8 +1319,13 @@ if [[ "${ROLE}" != "drone" ]]; then
 fi
 
 good "sessions up: ${SESSIONS[*]}"
-info "settling for ${SETTLE_S}s before the post-bringup preflight"
-sleep "${SETTLE_S}"
+SETTLE_T0=${SECONDS}
+wait_for_fmu
+SETTLE_LEFT=$(( SETTLE_S - (SECONDS - SETTLE_T0) ))
+if (( SETTLE_LEFT > 0 )); then
+  info "settling ${SETTLE_LEFT}s more (${SETTLE_S}s total) before the post-bringup preflight"
+  sleep "${SETTLE_LEFT}"
+fi
 
 VERDICT=0
 PREFLIGHT_RC=0
@@ -1138,6 +1340,9 @@ else
   # to whatever is reading the exit code.
   [[ "${PREFLIGHT_RC}" -eq 0 ]] || VERDICT=1
 fi
+# No FC data is a RED on its own, preflight or not: the platform and every
+# behaviour are up but nothing they do reaches the aircraft.
+[[ "${FMU_MISSING}" -eq 0 ]] || VERDICT=1
 
 if [[ "${VERDICT}" -eq 0 ]]; then
   if [[ "${SKIP_PREFLIGHT}" == "true" ]]; then
@@ -1151,6 +1356,7 @@ else
     "" \
     "preflight_check.py exited ${PREFLIGHT_RC} (1 = a check FAILED," \
     "2 = it could not verify anything: no ROS, bad arguments, all skipped)." \
+    "$([[ "${FMU_MISSING}" -eq 0 ]] || echo "${FMU_MISSING} aircraft with NO FLIGHT CONTROLLER DATA (see above).")" \
     "" \
     "The stack has been LEFT RUNNING on purpose: a torn-down stack cannot" \
     "be diagnosed. Read the FAIL rows above, fix, then:" \
@@ -1159,6 +1365,10 @@ else
 fi
 
 say ""
+if [[ "${XRCE_MODE}" != "n/a" ]]; then
+  say "  agent:   $([[ "${XRCE_MODE}" == "start" ]] && echo "started here -- ${XRCE_BIN} udp4 -p ${XRCE_PORT} in ${SESSION_PREFIX}${DRONE_NS[0]}:agent" || echo "REUSED a running one on udp/${XRCE_PORT} (not ours; --stop leaves it)")"
+  for line in "${FMU_RESULT[@]}"; do say "  fmu:     ${line}"; done
+fi
 say "  attach:  tmux attach -t ${SESSIONS[0]}"
 say "  list:    tmux list-sessions | grep '^${SESSION_PREFIX}'"
 say "  stop:    ${STOP_SCRIPT}"

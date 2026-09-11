@@ -25,6 +25,15 @@
 # listed explicitly below rather than hidden behind a wildcard so that anyone
 # can see exactly what gets killed before running it.
 #
+# THE uXRCE-DDS AGENT IS NOT IN THAT SWEEP, ON PURPOSE. In hardware mode the
+# launcher starts `MicroXRCEAgent udp4 -p 8888` in the `agent` window of the
+# drone session -- unless one was already running, in which case it reuses it
+# and must not kill it on the way out (a crew member's hand-started agent, or
+# verify_jetson.sh's). So the agent this script stops is defined by WHERE IT
+# LIVES, not by its name: every process descended from a pane of a window
+# called `agent` in an o134_* session is ours; any other MicroXRCEAgent is
+# reported and left alone. See stop_owned_agents() below.
+#
 # NOTE ON rviz2 AND robot_state_publisher: this sweep is by command line, and
 # those two do not carry anything that distinguishes this project's copies
 # from anyone else's. RViz is started inside as2_visualization; every namespace
@@ -49,6 +58,8 @@ session_stop.sh -- tear down the o134_* tmux sessions and their ROS nodes
   --list        show what would be stopped, then exit
   --no-sweep    kill the tmux sessions but do NOT pkill leftover nodes.
                 Use when you are debugging a node you started by hand.
+                The launcher's own uXRCE-DDS agent (window `agent`) is
+                still stopped -- it is part of the session, not a sweep.
   -h, --help    this text
 EOF
 }
@@ -71,12 +82,69 @@ done
 mapfile -t SESSIONS < <(tmux list-sessions -F '#{session_name}' 2>/dev/null \
                           | grep "^${SESSION_PREFIX}" || true)
 
+# --------------------------------------------------------------------------
+# the uXRCE-DDS agent the launcher started, found by where it lives
+# --------------------------------------------------------------------------
+AGENT_COMM="MicroXRCEAgent"
+
+descendants() {  # $1 = pid -> every descendant pid, depth first
+  local child
+  for child in $(pgrep -P "$1" 2>/dev/null); do
+    printf '%s\n' "${child}"
+    descendants "${child}"
+  done
+}
+
+owned_agent_pids() {
+  # pids of ${AGENT_COMM} processes living under a pane of a window named
+  # `agent` in any of the sessions we are about to stop.
+  local session pane_pid pid
+  for session in "${SESSIONS[@]}"; do
+    while read -r pane_pid; do
+      [[ -n "${pane_pid}" ]] || continue
+      for pid in "${pane_pid}" $(descendants "${pane_pid}"); do
+        [[ "$(cat "/proc/${pid}/comm" 2>/dev/null)" == "${AGENT_COMM}" ]] && printf '%s\n' "${pid}"
+      done
+    done < <(tmux list-panes -s -t "${session}" -F '#{window_name} #{pane_pid}' 2>/dev/null \
+               | awk '$1 == "agent" {print $2}')
+  done | sort -u
+}
+
+mapfile -t OWNED_AGENTS < <(owned_agent_pids)
+
+other_agents() {  # ${AGENT_COMM} pids that are NOT ours
+  local pid
+  for pid in $(pgrep -x "${AGENT_COMM}" 2>/dev/null); do
+    printf ' %s ' "${OWNED_AGENTS[*]:-}" | grep -q " ${pid} " || printf '%s\n' "${pid}"
+  done
+}
+
+stop_owned_agents() {
+  # After the panes have had their Ctrl-C: whatever of ours is still alive
+  # gets TERM, then KILL. Nothing else is touched.
+  local pid waited
+  for pid in "${OWNED_AGENTS[@]}"; do
+    if kill -0 "${pid}" 2>/dev/null; then
+      kill -TERM "${pid}" 2>/dev/null || true
+      waited=0
+      while kill -0 "${pid}" 2>/dev/null && [[ ${waited} -lt 30 ]]; do sleep 0.1; waited=$((waited + 1)); done
+      if kill -0 "${pid}" 2>/dev/null; then kill -KILL "${pid}" 2>/dev/null || true; sleep 0.2; fi
+      info "stopped the launcher's ${AGENT_COMM} (pid ${pid}, was still up after Ctrl-C)"
+    else
+      info "the launcher's ${AGENT_COMM} (pid ${pid}) exited on Ctrl-C"
+    fi
+  done
+}
+
 if [[ "${LIST_ONLY}" == "true" ]]; then
   if [[ ${#SESSIONS[@]} -eq 0 ]]; then
     info "no ${SESSION_PREFIX}* tmux sessions are running"
   else
     info "would stop: ${SESSIONS[*]}"
+    [[ ${#OWNED_AGENTS[@]} -eq 0 ]] || info "would stop the launcher's ${AGENT_COMM}: pid ${OWNED_AGENTS[*]}"
   fi
+  mapfile -t OTHERS < <(other_agents)
+  [[ ${#OTHERS[@]} -eq 0 ]] || info "would leave alone: ${AGENT_COMM} pid ${OTHERS[*]} (not started by the launcher)"
   exit 0
 fi
 
@@ -102,6 +170,10 @@ done
 # destructors. Two seconds is enough for every node in this stack; the sweep
 # below catches anything that is not.
 [[ ${#SESSIONS[@]} -eq 0 ]] || sleep 2
+
+# The agent we started, and only that one, before its pane goes away with
+# the session (so it is never left as an orphan holding udp/8888).
+[[ ${#OWNED_AGENTS[@]} -eq 0 ]] || stop_owned_agents
 
 # --------------------------------------------------------------------------
 # 2. kill the sessions
@@ -158,5 +230,14 @@ if [[ "${REMAINING}" == "0" ]]; then
   good "all ${SESSION_PREFIX}* sessions are down"
 else
   info "${REMAINING} ${SESSION_PREFIX}* session(s) still listed -- re-run to be sure"
+fi
+
+# Say what happened to the agent, whichever way it went: an agent that is
+# still up was not ours and the next launch will reuse it.
+mapfile -t OTHERS < <(other_agents)
+if [[ ${#OTHERS[@]} -gt 0 ]]; then
+  info "left alone: ${AGENT_COMM} pid ${OTHERS[*]} (not started by the launcher; the next launch will reuse it)"
+elif [[ ${#OWNED_AGENTS[@]} -gt 0 ]]; then
+  good "no ${AGENT_COMM} left running"
 fi
 exit 0

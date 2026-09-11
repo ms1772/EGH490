@@ -11,7 +11,8 @@
 #
 # The panes are grouped the same way the Aerostack2 Gazebo reference project
 # groups them -- platform / basics / behaviors -- so anyone who has used that
-# project can read this one.
+# project can read this one. Hardware mode adds one window in front of them,
+# agent, for the uXRCE-DDS agent the flight controller connects to.
 #
 # Paths are exported once, quoted, into O134_PROJECT and O134_REPO, because
 # the repository lives under a directory with a SPACE in its name on the
@@ -32,6 +33,9 @@ body        = @settings["rigid_body_name"]
 mocap_topic = @settings["mocap_topic"]
 log_level   = @settings["log_level"]
 middleware_env = @settings["middleware_env"]
+start_agent = @settings["start_xrce_agent"] == "true"
+xrce_agent  = @settings["xrce_agent"]
+xrce_port   = @settings["xrce_port"]
 sim         = (mode == "sim")
 %>
 name: o134_<%= ns %>
@@ -49,6 +53,28 @@ startup_window: basics
 pre_window: set +u && source /opt/ros/humble/setup.bash && source "<%= ws_setup %>" && export ROS_DOMAIN_ID=<%= domain_id %> && <%= middleware_env %> && export O134_PROJECT="<%= project_dir %>" && export O134_REPO="<%= repo_root %>"
 
 windows:
+
+<%- if !sim -%>
+<%- if start_agent -%>
+  # -- the uXRCE-DDS agent: the flight controller's only way into ROS 2 ----
+  # PX4's uxrce_dds_client dials THIS process (UXRCE_DDS_AG_IP / PRT on the
+  # FC) and nothing under /<fmu_prefix>/fmu/ exists until it has. It is the
+  # first window so it is listening before the platform comes up.
+  #
+  # Found 2026-09-11 on the bench: the drone role brought up 8/8 nodes and
+  # the platform published visual odometry into nothing, because every
+  # earlier test had started the agent by hand first. The launcher now
+  # starts it here -- unless udp/<xrce_port> is already bound by a running
+  # agent, in which case session_bringup.sh passes start_xrce_agent=false,
+  # this window is not created, and --stop leaves that agent alone.
+  #
+  # Verbosity is the agent's default (4: session/topic events, no per-packet
+  # spam). No `exec`: if the agent dies its last lines stay on screen.
+  - agent:
+      panes:
+        - <%= xrce_agent %> udp4 -p <%= xrce_port %>
+<%- end -%>
+<%- end -%>
 
   # -- the platform: the only component that differs between modes ---------
   - platform:

@@ -39,7 +39,8 @@ hard error rather than a guess:
 A project file that starts using some other Ruby will fail here with a line
 number, not render something subtly different from what tmuxinator renders.
 Rendering parity with tmuxinator 3.3.7 was checked pane by pane on the ground
-station (2026-09-11).
+station (2026-09-11), and again after drone.yaml gained the hardware-mode
+`agent` window (start_xrce_agent / xrce_agent / xrce_port settings).
 
 WHAT tmux SEES
 
@@ -416,6 +417,7 @@ def _base_settings(**over: str) -> Dict[str, str]:
         "middleware_env": "export RMW_IMPLEMENTATION='rmw_cyclonedds_cpp' && export CYCLONEDDS_URI='file:///tmp/x.xml'",
         "fmu_prefix": "/uav_0", "target_system_id": "1", "rigid_body_name": "drone0",
         "mocap_topic": "/drone0/mocap/rigid_bodies", "log_level": "info",
+        "start_xrce_agent": "true", "xrce_agent": "MicroXRCEAgent", "xrce_port": "8888",
         "drones_comma": "drone0,drone1", "guard_args": "--drones drone0,drone1 --dry-run",
         "guard_ros_args": "-r /drone0/fmu/in/vehicle_command:=/uav_0/fmu/in/vehicle_command",
         "mocap_bodies": "drone0 drone1", "rviz": "false", "viewer": "true",
@@ -474,25 +476,37 @@ def self_test() -> int:  # noqa: C901 -- a flat list of cases reads better
     ground_tpl = (PROJECTS_DIR / "ground_station.yaml").read_text(encoding="utf-8")
 
     hw = load_project(render(drone_tpl, _base_settings()))
-    check("drone.yaml (hardware): 3 windows, 5 panes",
-          [w.name for w in hw.windows] == ["platform", "basics", "behaviors"]
-          and sum(len(w.panes) for w in hw.windows) == 5)
+    check("drone.yaml (hardware): agent window first, then platform / basics / behaviors; 6 panes",
+          [w.name for w in hw.windows] == ["agent", "platform", "basics", "behaviors"]
+          and sum(len(w.panes) for w in hw.windows) == 6)
+    check("drone.yaml (hardware): the agent pane is exactly the agent command, from the settings",
+          hw.windows[0].panes == ["MicroXRCEAgent udp4 -p 8888"] and hw.windows[0].layout is None)
     check("drone.yaml (hardware): the platform pane is the pixhawk launch",
-          "as2_platform_pixhawk pixhawk_launch.py" in hw.windows[0].panes[0]
-          and "fmu_prefix:=/uav_0" in hw.windows[0].panes[0]
-          and "target_system_id:=1" in hw.windows[0].panes[0])
-    check("drone.yaml: every pane carries the namespace",
-          all("namespace:=drone0" in p for w in hw.windows for p in w.panes))
+          "as2_platform_pixhawk pixhawk_launch.py" in hw.windows[1].panes[0]
+          and "fmu_prefix:=/uav_0" in hw.windows[1].panes[0]
+          and "target_system_id:=1" in hw.windows[1].panes[0])
+    check("drone.yaml: every launch pane carries the namespace",
+          all("namespace:=drone0" in p for w in hw.windows[1:] for p in w.panes))
+    hw_alt = load_project(render(drone_tpl, _base_settings(xrce_agent="/opt/xrce/bin/MicroXRCEAgent",
+                                                           xrce_port="9999")))
+    check("drone.yaml (hardware): --xrce-agent / --xrce-port reach the agent pane",
+          hw_alt.windows[0].panes == ["/opt/xrce/bin/MicroXRCEAgent udp4 -p 9999"])
+    hw_reuse = load_project(render(drone_tpl, _base_settings(start_xrce_agent="false")))
+    check("drone.yaml (hardware, agent already running): no agent window, 3 windows, 5 panes",
+          [w.name for w in hw_reuse.windows] == ["platform", "basics", "behaviors"]
+          and sum(len(w.panes) for w in hw_reuse.windows) == 5)
     check("drone.yaml: pre_window runs the launcher's middleware fragment",
           "export CYCLONEDDS_URI='file:///tmp/x.xml'" in hw.pre_window
           and "export ROS_DOMAIN_ID=0" in hw.pre_window)
     check("drone.yaml: the session is named after the namespace", hw.name == "o134_drone0")
     sim = load_project(render(drone_tpl, _base_settings(mode="sim")))
+    check("drone.yaml (sim): no agent window even when asked -- there is no flight controller",
+          [w.name for w in sim.windows] == ["platform", "basics", "behaviors"])
     check("drone.yaml (sim): the platform pane is the simulator",
           "as2_platform_multirotor_simulator" in sim.windows[0].panes[0]
           and "pixhawk" not in sim.windows[0].panes[0])
     check("drone.yaml: mocap_topic reaches the estimator launch",
-          any("mocap_topic:=/drone0/mocap/rigid_bodies" in p for p in hw.windows[1].panes))
+          any("mocap_topic:=/drone0/mocap/rigid_bodies" in p for p in hw.windows[2].panes))
 
     gs = load_project(render(ground_tpl, _base_settings()))
     check("ground_station.yaml (hardware, 2 drones, no rviz): safety + monitoring only",
@@ -517,20 +531,22 @@ def self_test() -> int:  # noqa: C901 -- a flat list of cases reads better
     print("the tmux plan")
     cmds = plan(hw, "o134_drone0")
     joined = [" ".join(c) for c in cmds]
-    check("starts one detached session named as asked",
-          joined[0].startswith("tmux new-session -d -s o134_drone0 -n platform"))
-    check("two more windows", sum(1 for c in cmds if c[1] == "new-window") == 2)
+    check("starts one detached session named as asked, on the agent window",
+          joined[0].startswith("tmux new-session -d -s o134_drone0 -n agent"))
+    check("three more windows", sum(1 for c in cmds if c[1] == "new-window") == 3)
     check("panes - windows splits, each followed by a tiled relayout",
           sum(1 for c in cmds if c[1] == "split-window") == 2
           and all(cmds[i + 1][1:] == ["select-layout", "-t", cmds[i][3], "tiled"]
                   for i, c in enumerate(cmds) if c[1] == "split-window"))
     sends = [c for c in cmds if c[1] == "send-keys" and "-l" in c]
     check("pre_window then the command is typed into every pane",
-          len(sends) == 10 and all(sends[k][-1] == hw.pre_window for k in range(0, 10, 2)))
+          len(sends) == 12 and all(sends[k][-1] == hw.pre_window for k in range(0, 12, 2)))
+    check("the agent is the first command typed, into the first window's pane",
+          sends[1][-1] == "MicroXRCEAgent udp4 -p 8888" and sends[1][3] == "o134_drone0:agent.0")
     check("every typed line is followed by Enter",
           all(cmds[i + 1][1:] == ["send-keys", "-t", c[3], "Enter"]
               for i, c in enumerate(cmds) if c[1] == "send-keys" and "-l" in c))
-    check("each window gets its own layout last",
+    check("each launch window gets its own layout last; the one-pane agent window has none",
           [c[-1] for c in cmds if c[1] == "select-layout" and c[-1] != "tiled"]
           == ["even-vertical"] * 3)
     check("finishes on the startup window",
