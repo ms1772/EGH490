@@ -67,6 +67,16 @@ Actions are DRY RUN by default: the node logs what it would have sent and sends
 nothing. That is the bench default. `--arm` is the explicit, deliberately
 awkward flag that makes LAND and DISARM real.
 
+An ARMED guard that has never seen its mocap feed refuses to guard. If, by the
+end of `startup_grace_s`, no RigidBodies message carrying every watched body
+has arrived on the mocap topic, the node logs why and EXITS 2 instead of
+letting the `mocap_timeout` ladder run -- a ladder that would force-disarm an
+aircraft on the ground because the bridge was never started. Measured on
+2026-09-11: with no GS-side feed the guard reached DISARM 7 s after every
+ground bringup (dry run). In dry run the same situation is logged as an
+error once and the ladder is allowed to run, because seeing it is the point
+of a dry run.
+
 Usage:
     # bench / rig R1 -- logs the actions, sends nothing
     python3 volume_guard.py --drones drone0,drone1,drone2
@@ -97,7 +107,9 @@ Usage:
 Exit codes:
     0  clean shutdown, or --self-test passed
     1  --self-test failed
-    2  the configuration was refused -- the node did not run
+    2  the configuration was refused -- the node did not run; or, with --arm,
+       the mocap feed never arrived within the startup grace -- the node
+       refused to guard and exited before any action
 """
 
 from __future__ import annotations
@@ -609,6 +621,11 @@ class Measurements:
         }
 
 
+class GuardRefused(RuntimeError):
+    """An armed guard found no mocap feed at the end of its grace and will
+    not run. Raised out of the timer so rclpy.spin() returns it to main."""
+
+
 @dataclass(frozen=True)
 class Action:
     """One thing the node must actually do. The core decides; the node acts.
@@ -870,12 +887,16 @@ class GuardCore:
         self.guards: Dict[str, DroneGuard] = {
             ns: DroneGuard(ns, self.rigid_bodies[ns], self.policies, self.started_at)
             for ns in self.drones}
+        # Every rigid-body name ever seen on the feed, watched or not, so a
+        # refusal can say "the feed carries X, you asked for Y".
+        self.bodies_seen: set = set()
 
     # -- inputs ------------------------------------------------------------ #
 
     def on_mocap_body(self, body: str, position: Sequence[float],
                       quaternion: Optional[Sequence[float]], now: float) -> bool:
         """Feed one rigid body. Returns False for a body we do not watch."""
+        self.bodies_seen.add(str(body))
         ns = self.body_to_drone.get(str(body))
         if ns is None:
             return False
@@ -898,6 +919,42 @@ class GuardCore:
 
     def in_grace(self, now: float) -> bool:
         return (now - self.started_at) < self.limits.startup_grace_s
+
+    def drones_without_feed(self) -> List[str]:
+        """Drones whose rigid body has never appeared on the mocap feed."""
+        return [ns for ns in self.drones if self.guards[ns].mocap_recv_s is None]
+
+    def no_feed_refusal(self, now: float, armed: bool,
+                        topic: str = DEFAULT_MOCAP_TOPIC) -> Optional[str]:
+        """Why an ARMED guard must exit rather than escalate, or None.
+
+        Only meaningful at the end of the startup grace: before it, the feed
+        may simply not be up yet; after a drone HAS been seen, a later
+        silence is a genuine `mocap_timeout` and the ladder is the right
+        answer. A guard that never saw its feed cannot tell a lost aircraft
+        from a bridge nobody started, and its DISARM would land on the ground.
+        """
+        if not armed or self.in_grace(now):
+            return None
+        missing = self.drones_without_feed()
+        if not missing:
+            return None
+        grace = self.limits.startup_grace_s
+        if not self.bodies_seen:
+            why = (f"no RigidBodies message arrived on {topic} in the "
+                   f"{grace:g} s startup grace")
+        else:
+            wanted = ", ".join(f"'{self.rigid_bodies[ns]}' ({ns})" for ns in missing)
+            why = (f"{topic} is live but never carried {wanted} in the "
+                   f"{grace:g} s startup grace; bodies seen: "
+                   f"{sorted(self.bodies_seen)}")
+        return ("REFUSING TO GUARD WITH --arm: " + why + ". A guard that has "
+                "never seen its feed cannot tell a lost aircraft from a bridge "
+                "that was never started, and its mocap_timeout ladder would "
+                "force-disarm on the ground. Start the mocap chain first "
+                "(flight_ops/deploy/mocap_bringup.sh --gs, or "
+                "session_bringup.sh --mocap-server), check the rigid-body "
+                "names, then relaunch.")
 
     def update(self, now: float) -> List[Action]:
         """Advance every drone independently. Returns the actions to perform."""
@@ -1431,6 +1488,10 @@ def main_ros(cli: argparse.Namespace, argv: Optional[List[str]] = None) -> int:
                 raise SystemExit(2)
 
             self.dry_run = not bool(cli.arm)
+            self.mocap_topic = str(self.get_parameter("mocap_topic").value)
+            # Set once the grace has expired with every body seen; until then
+            # every tick asks whether an armed guard may keep running at all.
+            self._feed_verified = False
             if routing_problem and self.dry_run:
                 self.get_logger().warn(
                     "AMBIGUOUS DISARM ROUTING (harmless in dry run, REFUSED "
@@ -1448,8 +1509,7 @@ def main_ros(cli: argparse.Namespace, argv: Optional[List[str]] = None) -> int:
                                     durability=DurabilityPolicy.VOLATILE)
 
             self.create_subscription(
-                RigidBodies, str(self.get_parameter("mocap_topic").value),
-                self.on_mocap, sensor_qos)
+                RigidBodies, self.mocap_topic, self.on_mocap, sensor_qos)
             self.create_subscription(
                 String, str(self.get_parameter("health_topic").value),
                 self.on_health, 10)
@@ -1601,8 +1661,35 @@ def main_ros(cli: argparse.Namespace, argv: Optional[List[str]] = None) -> int:
         # -- the tick ------------------------------------------------------ #
 
         def on_timer(self) -> None:
-            for action in self.core.update(self.now_s()):
+            now = self.now_s()
+            if not self._feed_verified:
+                self.verify_feed(now)
+            for action in self.core.update(now):
                 self.perform(action)
+
+        def verify_feed(self, now: float) -> None:
+            """At the end of the grace: an armed guard with no feed exits 2
+            here, before update() can escalate anything. A dry-run guard
+            logs the same finding once and carries on, so the bench shows
+            what an armed guard would have refused."""
+            if self.core.in_grace(now):
+                return
+            refusal = self.core.no_feed_refusal(now, True, self.mocap_topic)
+            if refusal is None:
+                self._feed_verified = True
+                self.get_logger().info(
+                    f"mocap feed verified on {self.mocap_topic}: every watched "
+                    "body seen inside the startup grace")
+                return
+            if self.dry_run:
+                self._feed_verified = True
+                self.get_logger().error(
+                    "[DRY RUN] " + refusal.replace("REFUSING TO GUARD WITH --arm",
+                                                   "an ARMED guard would now EXIT 2")
+                    + " Dry run continues so the ladder can be watched.")
+                return
+            self.get_logger().fatal(refusal)
+            raise GuardRefused(refusal)
 
         def perform(self, action: Action) -> None:
             prefix = "[DRY RUN] would " if self.dry_run else ""
@@ -1694,15 +1781,21 @@ def main_ros(cli: argparse.Namespace, argv: Optional[List[str]] = None) -> int:
     except SystemExit as exc:
         rclpy.shutdown()
         return int(exc.code or 2)
+    rc = 0
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except GuardRefused as exc:
+        # Raised from the timer once the grace expired with no feed. Nothing
+        # was commanded; the exit code is what session_bringup.sh reads.
+        print(f"volume_guard: {exc}", file=sys.stderr)
+        rc = 2
     finally:
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
-    return 0
+    return rc
 
 
 def _pick(cli_value, param_value):
@@ -2113,6 +2206,47 @@ def self_test() -> int:  # noqa: C901 -- a flat list of cases reads better here
     core.update(1.0)
     check("and it arms the instant the grace expires",
           not core.in_grace(1.0) and core.guards["drone0"].state == WARN)
+
+    print("no feed at the end of the grace (an armed guard must refuse)")
+    limits = Limits(box=Box(margin=0.0), startup_grace_s=1.0)
+    core = GuardCore(["drone0", "drone1"], {"drone0": "drone0", "drone1": "RB2"},
+                     limits, _only(C_MOCAP_TIMEOUT, confirm_s=0.0, escalate_s=0.5),
+                     started_at=0.0)
+    check("both drones are without feed at start",
+          core.drones_without_feed() == ["drone0", "drone1"])
+    check("no refusal while the grace is running",
+          core.no_feed_refusal(0.5, True) is None)
+    check("no refusal ever in dry run", core.no_feed_refusal(1.0, False) is None)
+    reason = core.no_feed_refusal(1.0, True, "/mocap/rigid_bodies")
+    check("an armed guard is refused once the grace expires",
+          reason is not None and reason.startswith("REFUSING TO GUARD WITH --arm"))
+    check("the reason says no message arrived at all, names the topic and the grace",
+          reason is not None and "no RigidBodies message arrived on /mocap/rigid_bodies" in reason
+          and "1 s startup grace" in reason)
+    check("the reason tells the crew what to start",
+          reason is not None and "mocap_bringup.sh" in reason)
+    core.on_mocap_body("someone_else", (0.0, 0.0, 0.0), None, 0.9)
+    reason = core.no_feed_refusal(1.0, True, "/mocap/rigid_bodies")
+    check("a live feed carrying the WRONG body is still refused, and says which",
+          reason is not None and "is live but never carried" in reason
+          and "'drone0' (drone0)" in reason and "'RB2' (drone1)" in reason
+          and "someone_else" in reason)
+    core.on_mocap_body("drone0", (0.0, 0.0, 0.0), None, 0.95)
+    reason = core.no_feed_refusal(1.0, True)
+    check("one body seen, the other not: still refused, names only the missing one",
+          reason is not None and "never carried 'RB2' (drone1) in" in reason
+          and core.drones_without_feed() == ["drone1"])
+    core.on_mocap_body("RB2", (0.0, 0.0, 0.0), None, 0.99)
+    check("every body seen inside the grace: no refusal",
+          core.no_feed_refusal(1.0, True) is None and core.drones_without_feed() == [])
+    core.update(3.0)
+    check("a feed that was seen and then stopped is a mocap_timeout trip, not a refusal",
+          core.no_feed_refusal(3.0, True) is None
+          and core.guards["drone0"].state == WARN)
+    core = GuardCore(["drone0"], None, Limits(box=Box(margin=0.0), startup_grace_s=0.0),
+                     _only(C_MOCAP_TIMEOUT), started_at=0.0)
+    check("with a zero grace an armed guard with no feed is refused on the first tick",
+          core.no_feed_refusal(0.0, True) is not None)
 
     print("the DISARM message")
     cmd = build_disarm_command(target_system=2, timestamp_us=1234)

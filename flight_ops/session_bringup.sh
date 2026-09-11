@@ -61,6 +61,8 @@ TMUXINATOR_DIR="${PROJECT_DIR}/tmuxinator"
 PREFLIGHT="${SCRIPT_DIR}/preflight_check.py"
 STOP_SCRIPT="${SCRIPT_DIR}/session_stop.sh"
 TMUX_PROJECT_PY="${SCRIPT_DIR}/tmux_project.py"
+MOCAP_BRINGUP="${SCRIPT_DIR}/deploy/mocap_bringup.sh"
+GUARD_YAML="${PROJECT_DIR}/config/volume_guard.yaml"
 
 # Overridable, but with a default that matches the machine this was built on.
 AS2_WS="${AS2_WS:-${HOME}/as2_o134_ws}"
@@ -92,6 +94,18 @@ ATTACH="false"
 PRINT_PLAN="false"
 PREFLIGHT_EXTRA=()
 TMUX_RUNNER="auto"           # auto | tmuxinator | python -- see choose_runner()
+
+# The mocap chain (hardware only). --mocap-server starts deploy/mocap_bringup.sh
+# BEFORE the guard so /mocap/rigid_bodies exists when the guard looks for it.
+MOCAP_SERVER=""              # Motive / VRPN address; never defaulted, read it off Motive
+MOCAP_PORT="3883"
+MOCAP_TRACKERS=""            # Motive rigid-body names; default: drones.yaml rigid_body_name
+
+# --guard-arm gate: the guard's feed must be live at THIS rate for THIS long
+# at the moment of launch, or the launcher refuses. 50 Hz is half the 100 Hz
+# the chain is built for; below it the 100 ms mocap_timeout trips on jitter.
+GUARD_FEED_MIN_HZ="50"
+GUARD_FEED_WINDOW_S="3"
 
 # DDS, hardware mode, ground role. See setup_middleware() for the rules.
 CYCLONE_CONFIG=""            # "" = auto, "none" = leave the environment alone, or a file
@@ -158,6 +172,31 @@ SAFETY
                         Without it the guard runs in DRY RUN and only logs
                         what it would have sent. This is the bench default
                         and it is deliberately awkward to turn off.
+                        REFUSED in --hardware unless the guard's mocap topic
+                        (/mocap/rigid_bodies, config/volume_guard.yaml) has a
+                        live publisher at >= 50 Hz over 3 s, carrying every
+                        rigid body in --drones, measured right before launch.
+                        Measured 2026-09-11: with no GS-side feed the guard
+                        reaches DISARM 7 s after every ground bringup; armed,
+                        that force-disarms a landed aircraft. volume_guard.py
+                        itself also exits 2 if no feed arrives inside its
+                        startup grace, so the gate is enforced twice.
+
+MOCAP (hardware only)
+  --mocap-server IP     Start the OptiTrack chain (deploy/mocap_bringup.sh:
+                        vrpn_mocap client + vrpn_to_rigidbodies.py) BEFORE the
+                        stack. Ground role: the GS copy on /mocap/rigid_bodies
+                        that volume_guard reads. Drone role: this aircraft's
+                        copy on /<ns>/mocap/rigid_bodies that the estimator
+                        reads. Read the address off Motive's Streaming pane;
+                        it is deliberately not defaulted. The chain lives in
+                        its own tmux session (mocap_gs / mocap_<ns>), survives
+                        --stop, and is stopped with
+                          deploy/mocap_bringup.sh --stop --gs
+  --mocap-port N        VRPN port. Default 3883.
+  --mocap-tracker LIST  Rigid-body names exactly as Motive streams them, one
+                        per --drones entry, comma-separated. Default: the
+                        rigid_body_name column of drones.yaml (MBD-6).
   --skip-preflight      Do not run flight_ops/preflight_check.py at all.
                         Prints a very loud warning. Use only when you already
                         know the stack is broken and are debugging it.
@@ -244,6 +283,12 @@ while [[ $# -gt 0 ]]; do
     --no-rviz)        WANT_RVIZ="false" ;;
     --no-viewer)      WANT_VIEWER="false" ;;
     --guard-arm)      GUARD_ARM="true" ;;
+    --mocap-server)   MOCAP_SERVER="${2:?--mocap-server needs a value}"; shift ;;
+    --mocap-server=*) MOCAP_SERVER="${1#*=}" ;;
+    --mocap-port)     MOCAP_PORT="${2:?--mocap-port needs a value}"; shift ;;
+    --mocap-port=*)   MOCAP_PORT="${1#*=}" ;;
+    --mocap-tracker)  MOCAP_TRACKERS="${2:?--mocap-tracker needs a value}"; shift ;;
+    --mocap-tracker=*) MOCAP_TRACKERS="${1#*=}" ;;
     --skip-preflight) SKIP_PREFLIGHT="true" ;;
     --domain)         DOMAIN_ID="${2:?--domain needs a value}"; shift ;;
     --domain=*)       DOMAIN_ID="${1#*=}" ;;
@@ -289,6 +334,13 @@ esac
 [[ -d "${TMUXINATOR_DIR}" ]] || die "missing ${TMUXINATOR_DIR}"
 [[ -f "${PREFLIGHT}" ]] || die "missing ${PREFLIGHT}"
 [[ -f "${TMUX_PROJECT_PY}" ]] || die "missing ${TMUX_PROJECT_PY}"
+
+if [[ -n "${MOCAP_SERVER}" ]]; then
+  [[ "${MODE}" == "hardware" ]] || die "--mocap-server is for --hardware only. In --sim, fake_mocap.py publishes /mocap/rigid_bodies from inside the ground session."
+  [[ -f "${MOCAP_BRINGUP}" ]] || die "missing ${MOCAP_BRINGUP}"
+  [[ "${MOCAP_SERVER}" =~ ^[A-Za-z0-9._-]+$ ]] || die "--mocap-server '${MOCAP_SERVER}' does not look like an address"
+  [[ "${MOCAP_PORT}" =~ ^[0-9]+$ ]] || die "--mocap-port must be a number"
+fi
 
 # --------------------------------------------------------------------------
 # read config/drones.yaml -- the single source of per-aircraft truth
@@ -549,6 +601,9 @@ print_summary() {
   say "  project           ${PROJECT_DIR}"
   say "  volume guard      $([[ "${GUARD_ARM}" == "true" ]] && echo 'ARMED (land and disarm are REAL)' || echo 'dry run (logs only)')"
   say "  preflight         $([[ "${SKIP_PREFLIGHT}" == "true" ]] && echo 'SKIPPED' || echo 'enabled')"
+  if [[ "${MODE}" == "hardware" ]]; then
+    say "  mocap chain       $([[ -n "${MOCAP_SERVER}" ]] && echo "started here from VRPN ${MOCAP_SERVER}:${MOCAP_PORT}" || echo 'NOT started here (--mocap-server) -- must already be up')"
+  fi
   rule
   local i
   for i in "${!DRONE_NS[@]}"; do
@@ -602,6 +657,152 @@ build_guard_args() {
 
   GUARD_ROS_ARGS=""
   if [[ ${#remaps[@]} -gt 0 ]]; then GUARD_ROS_ARGS="${remaps[*]}"; fi
+}
+
+# --------------------------------------------------------------------------
+# the mocap chain (hardware) and the --guard-arm feed gate
+# --------------------------------------------------------------------------
+# WHY THE FEED IS CHECKED HERE AND NOT LEFT TO THE GUARD
+#
+# In --hardware nothing in the ground session publishes /mocap/rigid_bodies:
+# the estimator's feed is per aircraft (/<ns>/mocap/rigid_bodies, on the
+# Jetson) and the guard's is the GS-side copy, which only exists if someone
+# started it. On 2026-09-11 nobody had, and the guard -- correctly, by its
+# own rules -- walked its mocap_timeout ladder to DISARM 7 s after launch.
+# In dry run that is a log line. With --guard-arm it is a force-disarm of a
+# landed aircraft on every bringup. So:
+#
+#   1. --mocap-server starts the chain first (deploy/mocap_bringup.sh), and
+#   2. --guard-arm is refused unless the guard's topic is measured live --
+#      a publisher, >= GUARD_FEED_MIN_HZ over GUARD_FEED_WINDOW_S, every
+#      rigid body present -- right before the guard is started.
+#
+# volume_guard.py enforces the same rule from the inside (exit 2 if no feed
+# by the end of its startup grace). Two independent checks, one failure mode.
+mocap_bodies_csv() { local IFS=,; echo "${DRONE_BODY[*]}"; }
+
+mocap_cmd_ground() {
+  local bodies; bodies="$(mocap_bodies_csv)"
+  printf '%q --server %q --port %q --gs --tracker %q --body %q --wait 10' \
+    "${MOCAP_BRINGUP}" "${MOCAP_SERVER}" "${MOCAP_PORT}" "${MOCAP_TRACKERS:-${bodies}}" "${bodies}"
+}
+
+mocap_cmd_drone() {
+  local i="$1" tracker
+  if [[ -n "${MOCAP_TRACKERS}" ]]; then
+    IFS=',' read -r -a _trk <<< "${MOCAP_TRACKERS}"
+    tracker="${_trk[$i]:-${DRONE_BODY[$i]}}"
+  else
+    tracker="${DRONE_BODY[$i]}"
+  fi
+  printf '%q --server %q --port %q --drone %q --tracker %q --body %q --wait 10' \
+    "${MOCAP_BRINGUP}" "${MOCAP_SERVER}" "${MOCAP_PORT}" "${DRONE_NS[$i]}" "${tracker}" "${DRONE_BODY[$i]}"
+}
+
+run_mocap_chain() {  # $1 = command line (already quoted), $2 = label
+  info "mocap chain (${2}): ${1}"
+  local rc=0
+  eval "${1}" || rc=$?
+  case "${rc}" in
+    0) good "mocap chain (${2}) up with data" ;;
+    1) warn "mocap chain (${2}) is up but NO DATA arrived. Motive streaming / address / body name."
+       warn "The chain is left running and reconnects by itself. With --guard-arm the launcher will now refuse." ;;
+    *) die "mocap_bringup.sh (${2}) refused (exit ${rc}); see its message above" ;;
+  esac
+}
+
+start_mocap_chains() {
+  [[ -n "${MOCAP_SERVER}" ]] || return 0
+  local i
+  if [[ "${ROLE}" != "ground" ]]; then
+    for i in "${!DRONE_NS[@]}"; do run_mocap_chain "$(mocap_cmd_drone "${i}")" "${DRONE_NS[$i]}"; done
+  fi
+  if [[ "${ROLE}" != "drone" ]]; then
+    run_mocap_chain "$(mocap_cmd_ground)" "ground station"
+  fi
+}
+
+# The guard's own topic, read from the file the guard will be given, so the
+# gate measures what the guard will subscribe to and not a copy of the name.
+guard_mocap_topic() {
+  python3 - "${GUARD_YAML}" <<'PY' 2>/dev/null || printf '/mocap/rigid_bodies'
+import sys, yaml
+doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
+params = ((doc.get("/**") or {}).get("ros__parameters") or {})
+print(params.get("mocap_topic") or "/mocap/rigid_bodies")
+PY
+}
+
+guard_feed_gate() {
+  [[ "${GUARD_ARM}" == "true" ]] || return 0
+  [[ "${ROLE}" != "drone" ]] || return 0
+  if [[ "${MODE}" == "sim" ]]; then
+    info "--guard-arm in --sim: fake_mocap.py starts inside the ground session, so the launch-time feed gate does not apply; volume_guard.py's own grace check (exit 2 without a feed) still does."
+    return 0
+  fi
+  local topic; topic="$(guard_mocap_topic)"
+  info "--guard-arm: measuring the guard's feed ${topic} for ${GUARD_FEED_WINDOW_S} s (need a publisher, >= ${GUARD_FEED_MIN_HZ} Hz, bodies $(mocap_bodies_csv))"
+  local rc=0
+  python3 - "${topic}" "${GUARD_FEED_WINDOW_S}" "${GUARD_FEED_MIN_HZ}" "$(mocap_bodies_csv)" <<'PY' || rc=$?
+import sys, time
+topic, window, min_hz, bodies_csv = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
+wanted = [b for b in bodies_csv.split(",") if b]
+try:
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+    from mocap4r2_msgs.msg import RigidBodies
+except ImportError as exc:
+    print(f"  cannot probe {topic}: {exc} (source the workspace)")
+    sys.exit(1)
+rclpy.init()
+node = Node("o134_guard_feed_gate")
+count = [0]
+seen = set()
+def on_msg(m):
+    count[0] += 1
+    for b in m.rigidbodies:
+        seen.add(str(b.rigid_body_name))
+qos = QoSProfile(depth=50, history=HistoryPolicy.KEEP_LAST,
+                 reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE)
+node.create_subscription(RigidBodies, topic, on_msg, qos)
+t0 = time.monotonic()
+while time.monotonic() - t0 < window:
+    rclpy.spin_once(node, timeout_sec=0.05)
+elapsed = time.monotonic() - t0
+pubs = node.count_publishers(topic)
+node.destroy_node(); rclpy.shutdown()
+rate = count[0] / elapsed if elapsed > 0 else 0.0
+missing = [b for b in wanted if b not in seen]
+print(f"  {topic}: publishers={pubs} messages={count[0]} in {elapsed:.1f} s = {rate:.1f} Hz; bodies seen={sorted(seen)}")
+problems = []
+if pubs < 1:
+    problems.append(f"no publisher on {topic} (nothing is producing the guard's feed on this machine)")
+if rate < min_hz:
+    problems.append(f"{rate:.1f} Hz is below the {min_hz:g} Hz minimum" + (" -- a publisher exists but sends nothing: Motive streaming off, wrong address, or wrong tracker name" if pubs >= 1 and count[0] == 0 else ""))
+if missing:
+    problems.append(f"rigid bod{'y' if len(missing) == 1 else 'ies'} {missing} never appeared (Motive name vs drones.yaml rigid_body_name, MBD-6)")
+if problems:
+    for p in problems:
+        print(f"  REFUSED: {p}")
+    sys.exit(1)
+print(f"  OK: live at {rate:.1f} Hz with {sorted(seen)}")
+PY
+  if [[ ${rc} -ne 0 ]]; then
+    loud_banner "${C_RED}" \
+      "--guard-arm REFUSED: the volume guard has no live mocap feed" \
+      "" \
+      "An ARMED guard with no feed walks its mocap_timeout ladder to a" \
+      "FORCE-DISARM 7 s after launch, aircraft on the ground or not." \
+      "Nothing has been launched." \
+      "" \
+      "Start the feed first:  --mocap-server <motive-ip>   (or" \
+      "  deploy/mocap_bringup.sh --server <motive-ip> --gs), confirm" \
+      "  deploy/mocap_bringup.sh --status --gs   says MOCAP OK, then relaunch." \
+      "Or drop --guard-arm for a dry-run bringup." >&2
+    exit 2
+  fi
+  good "--guard-arm accepted: the guard's feed is live"
 }
 
 # --------------------------------------------------------------------------
@@ -890,6 +1091,13 @@ fi
 if [[ "${PRINT_PLAN}" == "true" ]]; then
   say ""
   say "Commands that would be run:"
+  if [[ -n "${MOCAP_SERVER}" ]]; then
+    [[ "${ROLE}" == "ground" ]] || for i in "${!DRONE_NS[@]}"; do say "  $(mocap_cmd_drone "${i}")"; done
+    [[ "${ROLE}" == "drone" ]] || say "  $(mocap_cmd_ground)"
+  fi
+  if [[ "${GUARD_ARM}" == "true" && "${ROLE}" != "drone" && "${MODE}" == "hardware" ]]; then
+    say "  [gate] --guard-arm: refuse unless $(guard_mocap_topic) is live at >= ${GUARD_FEED_MIN_HZ} Hz over ${GUARD_FEED_WINDOW_S} s with bodies $(mocap_bodies_csv)"
+  fi
   [[ "${ROLE}" == "ground" ]] || for i in "${!DRONE_NS[@]}"; do start_drone_session "${i}"; done
   [[ "${ROLE}" == "drone" ]] || start_ground_session
   say ""
@@ -898,6 +1106,10 @@ if [[ "${PRINT_PLAN}" == "true" ]]; then
 fi
 
 refuse_if_running "${SESSIONS[@]}"
+
+# The feed before the guard, and the gate before anything is launched.
+start_mocap_chains
+guard_feed_gate
 
 if [[ "${ROLE}" != "ground" ]]; then
   for i in "${!DRONE_NS[@]}"; do
@@ -950,6 +1162,9 @@ say ""
 say "  attach:  tmux attach -t ${SESSIONS[0]}"
 say "  list:    tmux list-sessions | grep '^${SESSION_PREFIX}'"
 say "  stop:    ${STOP_SCRIPT}"
+if [[ -n "${MOCAP_SERVER}" ]]; then
+  say "  mocap:   ${MOCAP_BRINGUP} --status $([[ "${ROLE}" == "drone" ]] && echo "--drone ${DRONE_NS[0]}" || echo '--gs')   (--stop to end it; --stop above leaves it running)"
+fi
 say ""
 
 if [[ "${ATTACH}" == "true" ]]; then
