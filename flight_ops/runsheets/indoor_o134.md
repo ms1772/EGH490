@@ -61,9 +61,12 @@ Before every flight test, without exception:
 1. Power the aircraft. FC boots, no unusual tones.
 2. `ping 10.41.10.2` from the Jetson. Replies.
 3. Start the agent: `MicroXRCEAgent udp4 -p 8888`. Reports a session.
-4. `ros2 topic list`. Expect 65 `/fmu/*` topics, unversioned names
-   (`vehicle_status`, not `vehicle_status_v1`). Capture the list — this is
-   the only place we get ground truth on it.
+4. `ros2 topic list`. Expect 65 topics under `/uav_N/fmu/`. Eight carry a
+   `_v1` suffix (`vehicle_status_v1`, `vehicle_local_position_v1`,
+   `battery_status_v1`, `home_position_v1`, `vehicle_attitude_setpoint_v1`,
+   `arming_check_request_v1`, `arming_check_reply_v1`, `airspeed_validated_v1`);
+   the rest do not. Measured on drone 0 on 11 Sept. Capture the list anyway
+   and compare — a different firmware build can change it.
 5. `ros2 topic info -v` on the topics the platform uses. Publisher and
    subscriber counts non-zero. Topics existing is not enough.
 6. Record battery voltage and airframe ID.

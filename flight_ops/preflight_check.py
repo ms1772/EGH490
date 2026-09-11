@@ -124,7 +124,11 @@ DEFAULT_TF_TOL_DEG = 1.0
 DEFAULT_FMU_TOPICS = (
     "/fmu/out/vehicle_odometry",
     "/fmu/out/vehicle_control_mode",
-    "/fmu/out/battery_status",
+    # MEASURED on the FC (PX4 v1.17, 11 Sept 2026): battery_status carries a
+    # MESSAGE_VERSION and is published as battery_status_v1. Eight of the 65
+    # topics are versioned; the rest of this list is not. dds_topics.yaml
+    # shows base names only and cannot be used to decide this.
+    "/fmu/out/battery_status_v1",
     "/fmu/out/sensor_combined",
     "/fmu/out/timesync_status",
     "/fmu/in/trajectory_setpoint",
@@ -1556,8 +1560,16 @@ def self_test() -> int:
           any("battery_status" in u for u in unmatched))
     check("a fully matched topic is neither",
           all("vehicle_odometry" not in u for u in unmatched))
-    check("the PX4 v1.17 topic list carries no _v1 suffixes",
-          all(not t.endswith("_v1") for t in DEFAULT_FMU_TOPICS))
+    # Pinned to what the flight controller actually publishes, not to a theory
+    # about it. An earlier version of this test asserted the opposite.
+    check("battery_status is the versioned name the FC publishes",
+          "/fmu/out/battery_status_v1" in DEFAULT_FMU_TOPICS
+          and "/fmu/out/battery_status" not in DEFAULT_FMU_TOPICS)
+    check("the flight-critical topics are unversioned, as measured",
+          all(t in DEFAULT_FMU_TOPICS for t in (
+              "/fmu/in/trajectory_setpoint", "/fmu/in/offboard_control_mode",
+              "/fmu/in/vehicle_command", "/fmu/in/vehicle_visual_odometry",
+              "/fmu/out/vehicle_odometry")))
 
     print("check selection")
     check("default selects everything", select_checks(CHECK_NAMES, None, None)
