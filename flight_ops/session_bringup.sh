@@ -60,6 +60,7 @@ DRONES_YAML="${PROJECT_DIR}/config/drones.yaml"
 TMUXINATOR_DIR="${PROJECT_DIR}/tmuxinator"
 PREFLIGHT="${SCRIPT_DIR}/preflight_check.py"
 STOP_SCRIPT="${SCRIPT_DIR}/session_stop.sh"
+TMUX_PROJECT_PY="${SCRIPT_DIR}/tmux_project.py"
 
 # Overridable, but with a default that matches the machine this was built on.
 AS2_WS="${AS2_WS:-${HOME}/as2_o134_ws}"
@@ -90,6 +91,7 @@ SETTLE_S="12"
 ATTACH="false"
 PRINT_PLAN="false"
 PREFLIGHT_EXTRA=()
+TMUX_RUNNER="auto"           # auto | tmuxinator | python -- see choose_runner()
 
 # DDS, hardware mode, ground role. See setup_middleware() for the rules.
 CYCLONE_CONFIG=""            # "" = auto, "none" = leave the environment alone, or a file
@@ -177,6 +179,13 @@ PLUMBING
   --attach              Attach to the first session when everything is up.
                         Default: leave the sessions detached and return.
   --print-plan          Print every command that would be run, then exit.
+  --tmux-runner R       auto | tmuxinator | python. What turns the two
+                        project files in lab_config/o134_project/tmuxinator/
+                        into tmux sessions. auto (default) uses tmuxinator
+                        when it is installed and flight_ops/tmux_project.py
+                        otherwise -- a Jetson has no Ruby and no sudo, so it
+                        is always the latter there. Same files, same panes;
+                        parity is checked by tmux_project.py --self-test.
 
 DDS (hardware mode, ground role -- the GS side of the wifi link)
   --jetson-peer IPS     Comma-separated addresses of the aircraft, written
@@ -251,6 +260,8 @@ while [[ $# -gt 0 ]]; do
     --cyclone-config=*) CYCLONE_CONFIG="${1#*=}" ;;
     --attach)         ATTACH="true" ;;
     --print-plan)     PRINT_PLAN="true" ;;
+    --tmux-runner)    TMUX_RUNNER="${2:?--tmux-runner needs a value}"; shift ;;
+    --tmux-runner=*)  TMUX_RUNNER="${1#*=}" ;;
     --stop)           exec "${STOP_SCRIPT}" ;;
     --status)
       say "o134 tmux sessions:"
@@ -269,9 +280,15 @@ case "${ROLE}" in
   *) die "--role must be drone, ground or all (got '${ROLE}')" ;;
 esac
 
+case "${TMUX_RUNNER}" in
+  auto|tmuxinator|python) ;;
+  *) die "--tmux-runner must be auto, tmuxinator or python (got '${TMUX_RUNNER}')" ;;
+esac
+
 [[ -f "${DRONES_YAML}" ]] || die "missing ${DRONES_YAML}"
 [[ -d "${TMUXINATOR_DIR}" ]] || die "missing ${TMUXINATOR_DIR}"
 [[ -f "${PREFLIGHT}" ]] || die "missing ${PREFLIGHT}"
+[[ -f "${TMUX_PROJECT_PY}" ]] || die "missing ${TMUX_PROJECT_PY}"
 
 # --------------------------------------------------------------------------
 # read config/drones.yaml -- the single source of per-aircraft truth
@@ -683,6 +700,34 @@ run_post_gate() {
 # --------------------------------------------------------------------------
 # tmux
 # --------------------------------------------------------------------------
+# WHICH PROGRAM TURNS A PROJECT FILE INTO A SESSION
+#
+# tmuxinator where it exists (the ground station), flight_ops/tmux_project.py
+# where it does not (every Jetson: no Ruby, no sudo, no rubygems from the
+# lab). Both take `start -n SESSION -p FILE key=value...`, both render the
+# same ERB and type the same lines into the same panes; tmux_project.py's
+# self-test pins that, and the two were compared line-for-line on the GS on
+# 2026-09-11. What matters is that the project FILES are the single source
+# and nobody has to retype a launch command on the aircraft.
+RUNNER=()
+RUNNER_NOTE=""
+choose_runner() {
+  local want="${TMUX_RUNNER}"
+  if [[ "${want}" == "auto" ]]; then
+    if command -v tmuxinator >/dev/null 2>&1; then want="tmuxinator"; else want="python"; fi
+  fi
+  case "${want}" in
+    tmuxinator)
+      command -v tmuxinator >/dev/null 2>&1 || die "--tmux-runner tmuxinator, but tmuxinator is not installed"
+      RUNNER=(tmuxinator start)
+      RUNNER_NOTE="tmuxinator $(tmuxinator version 2>/dev/null | head -1 || true)" ;;
+    python)
+      python3 "${TMUX_PROJECT_PY}" --self-test >/dev/null 2>&1         || die "flight_ops/tmux_project.py --self-test failed; run it to see why"
+      RUNNER=(python3 "${TMUX_PROJECT_PY}" start)
+      RUNNER_NOTE="flight_ops/tmux_project.py$(command -v tmuxinator >/dev/null 2>&1 || printf ' (tmuxinator is not installed)')" ;;
+  esac
+}
+
 session_exists() { tmux has-session -t "$1" 2>/dev/null; }
 
 refuse_if_running() {
@@ -698,7 +743,7 @@ like a hardware fault. Tear the old one down first:
 
 start_drone_session() {
   local i="$1" ns="${DRONE_NS[$i]}" session="${SESSION_PREFIX}${DRONE_NS[$i]}"
-  local cmd=(tmuxinator start -n "${session}" -p "${TMUXINATOR_DIR}/drone.yaml"
+  local cmd=("${RUNNER[@]}" -n "${session}" -p "${TMUXINATOR_DIR}/drone.yaml"
     "drone_namespace=${ns}"
     "mode=${MODE}"
     "project_dir=${PROJECT_DIR}"
@@ -719,7 +764,7 @@ start_drone_session() {
 start_ground_session() {
   build_guard_args
   local mocap_bodies="${DRONE_BODY[*]}"
-  local cmd=(tmuxinator start -n "${GROUND_SESSION}" -p "${TMUXINATOR_DIR}/ground_station.yaml"
+  local cmd=("${RUNNER[@]}" -n "${GROUND_SESSION}" -p "${TMUXINATOR_DIR}/ground_station.yaml"
     "drones_comma=${DRONES_CSV}"
     "mode=${MODE}"
     "project_dir=${PROJECT_DIR}"
@@ -806,7 +851,8 @@ setup_middleware
 print_middleware
 
 command -v tmux >/dev/null 2>&1 || die "tmux is not installed"
-command -v tmuxinator >/dev/null 2>&1 || die "tmuxinator is not installed"
+choose_runner
+info "tmux runner: ${RUNNER_NOTE}"
 
 # Package availability, checked before launching rather than discovered as a
 # dead tmux pane thirty seconds later.

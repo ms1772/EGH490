@@ -75,7 +75,10 @@ iputils-ping                        # reachability of the FC at 10.41.10.2
 net-tools                           # ss/netstat fallback when checking UDP 8888 is free
 
 # --- operating the aircraft at the bench ------------------------------------
-tmux                                # the session launcher pattern used by the ground station
+tmux                                # flight_ops/session_bringup.sh --role drone runs the stack in tmux
+@optional tmuxinator                # the GS's project runner (a Ruby gem, apt 'tmuxinator'). NOT required:
+                                    # without it the launcher uses flight_ops/tmux_project.py on the same
+                                    # project files (a Jetson has no Ruby and the operator has no sudo)
 @optional ros-humble-tf2-tools      # `ros2 run tf2_tools view_frames` when the TF tree is wrong
 @optional ros-humble-rmw-fastrtps-cpp # fallback RMW for isolating a Cyclone-specific fault
 @optional rsync                     # resumable re-delivery of the bundle over a flaky wifi link

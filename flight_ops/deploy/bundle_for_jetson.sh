@@ -6,7 +6,9 @@
 # RUN THIS ON THE WSL GROUND STATION (Ubuntu 22.04). Not on a Jetson.
 #
 #   flight_ops/deploy/bundle_for_jetson.sh
-#   scp o134_bundle_<stamp>.tar.gz jetson@10.88.51.230:~/     # printed at the end
+#   scp o134_bundle_<stamp>.tar.gz jetson@10.88.38.136:~/     # printed at the end
+#                                  ^ a DHCP lease (jetsonorinnx, 2026-09-11);
+#                                    pass --jetson if it has moved
 #
 # WHY A BUNDLE AT ALL
 #
@@ -30,7 +32,14 @@
 #   flight_ops/deploy/               this kit, so the Jetson can re-run it
 #   flight_ops/nodes/                vrpn_to_rigidbodies.py (each Jetson runs its own)
 #   flight_ops/patches/              the patch and its evidence, for provenance
-#   flight_ops/lab_config/           the gates and the indoor parameter set, for reference
+#   flight_ops/lab_config/           the gates, the indoor parameter set, and the
+#                                    o134_project tree the launcher reads
+#   flight_ops/session_bringup.sh    THE launcher (--role drone on the aircraft),
+#   flight_ops/session_stop.sh       its teardown, the props-on gate it runs, the
+#   flight_ops/preflight_check.py    tmux runner it falls back to (no Ruby on a
+#   flight_ops/tmux_project.py       Jetson), the self-test runner and the graph
+#   flight_ops/run_selftests.py      tool. Found missing on 2026-09-11: the drone
+#   flight_ops/ros_graph.py          role could not be launched on the aircraft.
 #   apt/ros.key                      the ROS archive key, so the Jetson needs no curl
 #   wheels/                          aarch64 python wheels          (--with-wheels)
 #   debs/                            arm64 .deb closure             (--with-debs)
@@ -65,7 +74,9 @@ NAME=""
 WITH_WHEELS=0
 WITH_DEBS=0
 JETSON_STATUS=""
-JETSON_HOST="jetson@10.88.51.230"
+# DHCP lease of jetsonorinnx (drone0) on 2026-09-11. Only used to print the
+# delivery commands; pass --jetson when the lease has moved.
+JETSON_HOST="jetson@10.88.38.136"
 KEEP_STAGE=0
 NO_XRCE=0
 
@@ -77,12 +88,13 @@ Options:
   --ws DIR              Ground-station workspace. Default ~/as2_o134_ws
   --out DIR             Where to write the tarball. Default: current directory
   --name NAME           Bundle basename. Default o134_bundle_<UTC stamp>
-  --jetson HOST         Used only to print the scp line. Default jetson@10.88.51.230
+  --jetson HOST         Used only to print the scp line. Default jetson@10.88.38.136
+                        (a DHCP lease -- check `hostname -I` on the Jetson)
   --with-wheels         Also download aarch64 wheels for pymavlink/fastcrc/pyserial
   --with-debs           Also stage the arm64 .deb closure. REQUIRES --jetson-status.
                         UNVERIFIED -- read the warning it prints.
   --jetson-status FILE  A copy of the Jetson's /var/lib/dpkg/status, for --with-debs:
-                          scp jetson@10.88.51.230:/var/lib/dpkg/status ./jetson_dpkg_status
+                          scp jetson@10.88.38.136:/var/lib/dpkg/status ./jetson_dpkg_status
   --no-xrce             Skip the Micro-XRCE-DDS-Agent clone (you already have one)
   --keep-stage          Leave the staging directory behind for inspection
   -h, --help            This text
@@ -271,6 +283,21 @@ for d in deploy nodes patches lab_config; do
     warn "flight_ops/${d} does not exist in the repo -- skipped"
   fi
 done
+# The launcher and what `--role drone` needs from it, so the aircraft runs
+# THE SAME session_bringup.sh as the ground station (jetson_setup.sh phase
+# 'workspace' copies this whole tree to ~/as2_o134_ws/flight_ops/, which is
+# the layout the launcher resolves its paths from). Every one of these is
+# required: the launcher refuses to start without preflight_check.py,
+# session_stop.sh and tmux_project.py, and run_selftests.py is how the
+# self-tests are run on the aircraft. Missing = STOP, not WARN: a bundle
+# without the launcher is the 2026-09-11 failure again.
+for f in session_bringup.sh session_stop.sh preflight_check.py tmux_project.py \
+         run_selftests.py ros_graph.py; do
+  [ -f "${REPO_ROOT}/flight_ops/${f}" ] || die "flight_ops/${f} is missing from the repo; the launcher cannot be shipped without it"
+  cp "${REPO_ROOT}/flight_ops/${f}" "${STAGE}/flight_ops/${f}"
+  ok "flight_ops/${f} staged"
+done
+chmod +x "${STAGE}"/flight_ops/*.sh "${STAGE}"/flight_ops/*.py 2>/dev/null || true
 chmod +x "${STAGE}"/flight_ops/deploy/*.sh 2>/dev/null || true
 chmod +x "${STAGE}"/flight_ops/patches/*.sh 2>/dev/null || true
 

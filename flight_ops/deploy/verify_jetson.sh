@@ -29,10 +29,14 @@
 #   python_deps    pymavlink, fastcrc, pyserial importable
 #   workspace      px4_msgs + as2_platform_pixhawk built, node binary present
 #   platform_patch the O134 kill-switch and odom-staleness changes are in the source
+#   launcher       flight_ops/session_bringup.sh is on this aircraft and its
+#                  --role drone --print-plan runs (project files, runner, PRE gate)
 #   xrce_agent     MicroXRCEAgent on PATH and runnable
 #   fc_link        enP8p1s0 holds 10.41.10.1 and 10.41.10.2 answers
 #   route          the default route is NOT the phantom 10.41.10.254
 #   fleet_iface    the Cyclone interface exists, is UP, and matches cyclonedds.xml
+#   dds_cap        cyclonedds.xml raises MaxAutoParticipantIndex (default 9 = ten
+#                  participants, which is exactly the drone stack; the eleventh dies)
 #   gs_reach       the ground station answers            (needs --gs-host)
 #   time_sync      the clock is disciplined
 #   udp_port       UDP 8888 is free (or already held by our own agent)
@@ -82,7 +86,12 @@ readonly XRCE_PORT="8888"
 readonly FMU_TOPICS_OUT="/fmu/out/vehicle_odometry /fmu/out/vehicle_control_mode /fmu/out/battery_status_v1 /fmu/out/sensor_combined /fmu/out/timesync_status"
 readonly FMU_TOPICS_IN="/fmu/in/trajectory_setpoint /fmu/in/offboard_control_mode /fmu/in/vehicle_command /fmu/in/vehicle_visual_odometry"
 
-readonly ALL_CHECKS="arch os ros_install ros_env apt_packages aerostack2 python_deps workspace platform_patch xrce_agent fc_link route fleet_iface gs_reach time_sync udp_port fmu_topics fmu_endpoints"
+readonly ALL_CHECKS="arch os ros_install ros_env apt_packages aerostack2 python_deps workspace platform_patch launcher xrce_agent fc_link route fleet_iface dds_cap gs_reach time_sync udp_port fmu_topics fmu_endpoints"
+
+# Cyclone's default MaxAutoParticipantIndex is 9 -> ten participants per host
+# per domain, and the drone stack IS ten (2026-09-11: Takeoff and GoTo died
+# at launch). jetson_setup.sh writes 50; anything from 32 up is accepted.
+readonly MIN_PARTICIPANT_INDEX=32
 
 PASS="PASS"; FAIL="FAIL"; SKIP="SKIP"
 EXIT_GREEN=0; EXIT_FAIL=1; EXIT_UNVERIFIED=2
@@ -416,6 +425,54 @@ check_platform_patch() {
     row platform_patch "O134 patch" "${FAIL}" "missing:${missing:- none}${regressed}"
   else
     row platform_patch "O134 patch" "${PASS}" "kill switch force-disarms; external-odom staleness gate present; GPS fields renamed"
+  fi
+}
+
+check_launcher() {
+  local fo="${WS}/flight_ops" problems="" f
+  for f in session_bringup.sh session_stop.sh preflight_check.py tmux_project.py run_selftests.py \
+           lab_config/o134_project/tmuxinator/drone.yaml lab_config/o134_project/config/drones.yaml; do
+    [ -f "${fo}/${f}" ] || problems="${problems} ${f} absent;"
+  done
+  if [ -n "${problems}" ]; then
+    row launcher "${fo}" "${FAIL}" "${problems} -- re-bundle (bundle_for_jetson.sh ships them) and re-run jetson_setup.sh --only workspace"
+    return 0
+  fi
+  if [ -z "${DRONE_NS}" ]; then
+    row launcher "${fo}" "${SKIP}" "files present; --drone-ns not given, so --print-plan was not exercised"
+    return 0
+  fi
+  # The real thing, in plan mode: reads drones.yaml, picks the tmux runner,
+  # runs the PRE gate (preflight_check.py --self-test) and renders every
+  # launch command. Exit 0 means the drone role can be started here.
+  local out rc=0 runner
+  out="$(AS2_WS="${WS}" "${fo}/session_bringup.sh" --hardware --role drone --drones "${DRONE_NS}" --print-plan 2>&1)" || rc=$?
+  runner="$(printf '%s\n' "${out}" | sed -n 's/.*tmux runner: //p' | head -1)"
+  if [ "${rc}" -eq 0 ]; then
+    row launcher "${fo}" "${PASS}" "session_bringup.sh --hardware --role drone --drones ${DRONE_NS} --print-plan exit 0; runner: ${runner:-?}"
+  else
+    row launcher "${fo}" "${FAIL}" "--print-plan exited ${rc}: $(printf '%s\n' "${out}" | grep -m1 'FATAL' || printf '%s\n' "${out}" | tail -1)"
+  fi
+}
+
+check_dds_cap() {
+  local cfg="${CYCLONEDDS_URI:-}" n
+  cfg="${cfg#file://}"
+  if [ -z "${cfg}" ] || [ ! -r "${cfg}" ]; then
+    row dds_cap "-" "${FAIL}" "no readable CYCLONEDDS_URI config (source setup_env.sh)"
+    return 0
+  fi
+  if ! grep -q "<ParticipantIndex>auto</ParticipantIndex>" "${cfg}"; then
+    row dds_cap "$(basename "${cfg}")" "${SKIP}" "ParticipantIndex is not auto, so the cap does not apply (but peer discovery then needs multicast)"
+    return 0
+  fi
+  n="$(sed -n 's/.*<MaxAutoParticipantIndex>\([0-9]*\)<\/MaxAutoParticipantIndex>.*/\1/p' "${cfg}" | head -1)"
+  if [ -z "${n}" ]; then
+    row dds_cap "$(basename "${cfg}")" "${FAIL}" "MaxAutoParticipantIndex not set: Cyclone's default 9 allows ten participants and the drone stack is ten -- nodes die with 'Failed to find a free participant index'. Re-run jetson_setup.sh --only env"
+  elif [ "${n}" -lt "${MIN_PARTICIPANT_INDEX}" ]; then
+    row dds_cap "$(basename "${cfg}")" "${FAIL}" "MaxAutoParticipantIndex ${n} < ${MIN_PARTICIPANT_INDEX}; re-run jetson_setup.sh --only env"
+  else
+    row dds_cap "$(basename "${cfg}")" "${PASS}" "MaxAutoParticipantIndex ${n} ($((n + 1)) participants per domain on this host)"
   fi
 }
 
