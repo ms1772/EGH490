@@ -683,8 +683,26 @@ fmu_bring_up() {
   # Discovery needs a moment, and PX4 only creates its topics once the client
   # has a session.
   sleep "${FMU_WINDOW}"
-  FMU_TOPIC_LIST="$(ros2 topic list 2>/dev/null || true)"
-  [ -n "${FMU_TOPIC_LIST}" ] || { FMU_ERR="ros2 topic list returned nothing"; return 1; }
+  # `ros2 topic list` answers from the CLI daemon's graph cache. A daemon
+  # that was started by this very call (nothing else has run ros2 yet, or the
+  # previous one was stopped) answers before discovery has finished and
+  # returns a partial or empty list -- seen 2026-09-11: 0 /uav_0/fmu topics
+  # here while fmu_endpoints matched 9/9 one second later. So poll until the
+  # list carries the required set, up to ~20 s, and report how long it took.
+  local attempt=0 have=0 t
+  while :; do
+    attempt=$((attempt + 1))
+    FMU_TOPIC_LIST="$(ros2 topic list 2>/dev/null || true)"
+    have=0
+    for t in ${FMU_TOPICS_OUT} ${FMU_TOPICS_IN}; do
+      printf '%s\n' "${FMU_TOPIC_LIST}" | grep -qx "$(fmu_topic "${t}")" && have=$((have + 1))
+    done
+    [ "${have}" -ge 9 ] && break
+    [ "${attempt}" -ge 5 ] && break
+    sleep 4
+  done
+  [ "${attempt}" -eq 1 ] || FMU_NOTE="${FMU_NOTE}; topic list complete after $((attempt - 1)) extra poll(s)"
+  [ -n "${FMU_TOPIC_LIST}" ] || { FMU_ERR="ros2 topic list returned nothing after ${attempt} attempts"; return 1; }
   return 0
 }
 
