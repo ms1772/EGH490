@@ -70,9 +70,16 @@ readonly FC_PHANTOM_GW="10.41.10.254"
 readonly FLEET_IFACE_DEFAULT="wlP1p1s0"
 readonly XRCE_PORT="8888"
 
-# PX4 v1.17 dds_topics.yaml -- unversioned names, no _v1 suffix. Same list as
-# preflight_check.py's DEFAULT_FMU_TOPICS, deliberately.
-readonly FMU_TOPICS_OUT="/fmu/out/vehicle_odometry /fmu/out/vehicle_control_mode /fmu/out/battery_status /fmu/out/sensor_combined /fmu/out/timesync_status"
+# Topic names as MEASURED on the aircraft (PX4 v1.17.0, 2026-09-11, `ros2 topic
+# list` with the agent up): PX4 appends _v1 to the topics of VERSIONED
+# messages -- battery_status_v1, vehicle_status_v1, vehicle_local_position_v1,
+# home_position_v1, vehicle_attitude_setpoint_v1 (in) -- and leaves the rest
+# bare. Of the nine required here only battery_status is versioned.
+# preflight_check.py's DEFAULT_FMU_TOPICS and the O134 patch to
+# as2_platform_pixhawk (battery_status subscriber, vehicle_attitude_setpoint
+# publisher) carry the same measured names. dds_topics.yaml in the PX4 tree
+# shows base names only and cannot settle this; only `ros2 topic list` can.
+readonly FMU_TOPICS_OUT="/fmu/out/vehicle_odometry /fmu/out/vehicle_control_mode /fmu/out/battery_status_v1 /fmu/out/sensor_combined /fmu/out/timesync_status"
 readonly FMU_TOPICS_IN="/fmu/in/trajectory_setpoint /fmu/in/offboard_control_mode /fmu/in/vehicle_command /fmu/in/vehicle_visual_odometry"
 
 readonly ALL_CHECKS="arch os ros_install ros_env apt_packages aerostack2 python_deps workspace platform_patch xrce_agent fc_link route fleet_iface gs_reach time_sync udp_port fmu_topics fmu_endpoints"
@@ -96,6 +103,7 @@ SKIP_LIST=""
 # Accepts a literal prefix ("/uav_0") or "{ns}", substituted with --drone-ns,
 # matching preflight_check.py and volume_guard.py's --fmu-prefix.
 FMU_PREFIX="${O134_FMU_PREFIX:-}"
+FMU_PREFIX_CLI=0; FC_IFACE_CLI=0; FLEET_IFACE_CLI=0
 WITH_FMU=0
 NO_SOURCE=0
 JSON_OUT=""
@@ -111,10 +119,10 @@ while [ $# -gt 0 ]; do
     --drone-ns)    DRONE_NS="${2:?}"; shift 2 ;;
     --ws)          WS="${2:?}"; shift 2 ;;
     --xrce-prefix) XRCE_PREFIX="${2:?}"; shift 2 ;;
-    --fc-iface)    FC_IFACE="${2:?}"; shift 2 ;;
-    --fleet-iface) FLEET_IFACE="${2:?}"; shift 2 ;;
+    --fc-iface)    FC_IFACE="${2:?}"; FC_IFACE_CLI=1; shift 2 ;;
+    --fleet-iface) FLEET_IFACE="${2:?}"; FLEET_IFACE_CLI=1; shift 2 ;;
     --gs-host)     GS_HOST="${2:?}"; shift 2 ;;
-    --fmu-prefix)  FMU_PREFIX="${2:?}"; shift 2 ;;
+    --fmu-prefix)  FMU_PREFIX="${2?}"; FMU_PREFIX_CLI=1; shift 2 ;;   # ${2?}: an EMPTY prefix (bare /fmu/) is a valid, deliberate choice
     --only)        ONLY="${2:?}"; shift 2 ;;
     --skip)        SKIP_LIST="${2:?}"; shift 2 ;;
     --with-fmu)    WITH_FMU=1; shift ;;
@@ -194,6 +202,15 @@ if [ "${NO_SOURCE}" -eq 0 ]; then
   fi
 fi
 [ -n "${DRONE_NS}" ] || DRONE_NS="${AS2_DRONE_NS:-<unset>}"
+# The O134_* exports come from setup_env.sh, which was sourced just above --
+# AFTER the defaults at the top of this script were evaluated. Without this,
+# O134_FMU_PREFIX (and the interface names) written by jetson_setup.sh were
+# silently ignored unless the caller's shell had already sourced setup_env.sh,
+# and --with-fmu checked the bare /fmu/ prefix on an FC publishing /uav_0/fmu/.
+# A value given on the command line still wins.
+[ "${FMU_PREFIX_CLI}" -eq 1 ] || FMU_PREFIX="${O134_FMU_PREFIX:-${FMU_PREFIX}}"
+[ "${FC_IFACE_CLI}" -eq 1 ]    || FC_IFACE="${O134_FC_IFACE:-${FC_IFACE}}"
+[ "${FLEET_IFACE_CLI}" -eq 1 ] || FLEET_IFACE="${O134_FLEET_IFACE:-${FLEET_IFACE}}"
 
 # Resolve "{ns}" the way preflight_check.py and volume_guard.py do.
 case "${FMU_PREFIX}" in
@@ -288,20 +305,40 @@ check_apt_packages() {
 }
 
 check_aerostack2() {
+  # The version that matters is as2_core's: it is what as2_platform_pixhawk
+  # links against and what the O134 patch was reasoned against. The
+  # ros-humble-aerostack2 METApackage is no longer published for jammy arm64
+  # (its gazebo/visualization dependencies have no arm64 build), so the Jetson
+  # carries the component packages listed in packages.txt instead; the
+  # apt_packages check covers their presence, this check covers the version.
   local v
-  v="$(dpkg-query -W -f='${Version}' ros-humble-aerostack2 2>/dev/null || true)"
+  v="$(dpkg-query -W -f='${Version}' ros-humble-as2-core 2>/dev/null || true)"
   if [ -z "${v}" ]; then
-    row aerostack2 "ros-humble-aerostack2" "${FAIL}" "not installed -- as2_platform_pixhawk cannot link without as2_core"
+    row aerostack2 "ros-humble-as2-core" "${FAIL}" "not installed -- as2_platform_pixhawk cannot link without as2_core"
     return 0
   fi
-  local arch; arch="$(dpkg-query -W -f='${Architecture}' ros-humble-aerostack2 2>/dev/null || echo '?')"
+  local arch; arch="$(dpkg-query -W -f='${Architecture}' ros-humble-as2-core 2>/dev/null || echo '?')"
   local core=""
   [ -d "/opt/ros/${EXPECTED_ROS_DISTRO}/share/as2_core" ] && core="as2_core present"
+  local meta
+  meta="$(dpkg-query -W -f='${Version}' ros-humble-aerostack2 2>/dev/null || true)"
+  [ -n "${meta}" ] && meta="; metapackage ${meta}" || meta="; metapackage not installed (not in the arm64 index -- components instead)"
+  # Every as2 component must agree with as2_core, or the ABI is mixed.
+  local p pv mixed=""
+  for p in $(dpkg-query -W -f='${binary:Package}\n' 'ros-humble-as2-*' 2>/dev/null | grep -v dbgsym); do
+    pv="$(dpkg-query -W -f='${Version}' "${p}" 2>/dev/null || true)"
+    case "${pv}" in 1.1.3*) ;; *) mixed="${mixed} ${p}=${pv}" ;; esac
+  done
   # The ground station is pinned at 1.1.3; a different version onboard means the
   # platform patch was reasoned against a different as2_core API.
   case "${v}" in
-    1.1.3*) row aerostack2 "${arch}" "${PASS}" "${v} (matches the ground station); ${core:-as2_core MISSING}" ;;
-    *)      row aerostack2 "${arch}" "${FAIL}" "${v} -- the ground station and the platform patch assume 1.1.3; see flight_ops/patches/PATCHES.md" ;;
+    1.1.3*)
+      if [ -n "${mixed}" ]; then
+        row aerostack2 "${arch}" "${FAIL}" "as2_core ${v} but other as2 packages are not 1.1.3:${mixed}"
+      else
+        row aerostack2 "${arch}" "${PASS}" "as2_core ${v} (matches the ground station); ${core:-as2_core MISSING}${meta}"
+      fi ;;
+    *)      row aerostack2 "${arch}" "${FAIL}" "as2_core ${v} -- the ground station and the platform patch assume 1.1.3; see flight_ops/patches/PATCHES.md" ;;
   esac
 }
 
@@ -391,12 +428,19 @@ check_xrce_agent() {
     row xrce_agent "MicroXRCEAgent" "${FAIL}" "not on PATH and not at ${XRCE_PREFIX}/bin -- it is NOT an apt package; jetson_setup.sh --only agent builds it"
     return 0
   fi
-  # Run it, and test the exit status of the binary itself -- not of a pipeline
-  # whose last stage is always successful.
-  if ! LD_LIBRARY_PATH="${XRCE_PREFIX}/lib:${LD_LIBRARY_PATH:-}" "${bin}" --help >/dev/null 2>&1; then
+  # Run it. MicroXRCEAgent has no --help flag: v2.4.x treats it as an invalid
+  # transport, prints its usage banner and exits 1 (measured on the Jetson:
+  # `--help rc=1`, banner on stdout). So the exit status alone cannot separate
+  # "runs" from "will not run" -- a dynamic-link failure also exits non-zero
+  # but prints a loader error and no banner. Accept the banner as proof that
+  # the binary loads its shared libraries and executes.
+  # (the banner carries a NUL byte, which bash warns about -- strip it)
+  local out rc
+  out="$(LD_LIBRARY_PATH="${XRCE_PREFIX}/lib:${LD_LIBRARY_PATH:-}" "${bin}" --help 2>&1 | tr -d '\0'; exit "${PIPESTATUS[0]}")"; rc=$?
+  if [ "${rc}" -ne 0 ] && ! printf '%s' "${out}" | grep -qi 'usage'; then
     local why
-    why="$(LD_LIBRARY_PATH="${XRCE_PREFIX}/lib:${LD_LIBRARY_PATH:-}" "${bin}" --help 2>&1 | head -2 | tr '\n' ' ')"
-    row xrce_agent "${bin}" "${FAIL}" "will not run: ${why:-no output}; try: ldd ${bin}"
+    why="$(printf '%s' "${out}" | head -2 | tr '\n' ' ')"
+    row xrce_agent "${bin}" "${FAIL}" "will not run (exit ${rc}): ${why:-no output}; try: ldd ${bin}"
     return 0
   fi
   local miss
@@ -457,7 +501,11 @@ check_fleet_iface() {
   [ "${state}" = "UP" ] || problems="${problems} link is ${state};"
   [ -n "${addr}" ] || problems="${problems} no IPv4 address;"
   # cyclonedds.xml must name THIS interface, or Cyclone is bound elsewhere.
-  local cfg="${CYCLONEDDS_URI#file://}"
+  # ${CYCLONEDDS_URI:-} not ${CYCLONEDDS_URI}: this script runs under set -u,
+  # and with --no-source (or a missing setup_env.sh) the variable is unset, so
+  # the bare expansion aborted the whole check with "unbound variable".
+  local cfg="${CYCLONEDDS_URI:-}"
+  cfg="${cfg#file://}"
   if [ -n "${cfg}" ] && [ -r "${cfg}" ]; then
     if grep -q "NetworkInterface name=\"${FLEET_IFACE}\"" "${cfg}"; then
       problems="${problems}"

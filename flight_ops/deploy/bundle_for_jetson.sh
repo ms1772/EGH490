@@ -473,8 +473,10 @@ xrce/Micro-XRCE-DDS-Agent
 
 aerostack2
   ground station  : $(dpkg-query -W -f='${Version} (${Architecture})' ros-humble-aerostack2 2>/dev/null || echo 'not installed here')
-  on the Jetson   : installed from apt -- ros-humble-aerostack2 HAS ubuntu_jammy_arm64
-                    binaries (buildfarm job Hbin_ujv8_uJv8__aerostack2__ubuntu_jammy_arm64__binary)
+  on the Jetson   : installed from apt as the ros-humble-as2-* COMPONENT packages
+                    listed in flight_ops/deploy/packages.txt. The ros-humble-aerostack2
+                    metapackage is no longer in the jammy arm64 index (observed
+                    2026-09-11); the components are, at 1.1.3.
 
 extras
   wheels          : $( [ -d "${STAGE}/wheels" ] && ls -1 "${STAGE}/wheels" | wc -l || echo 0 ) file(s)
