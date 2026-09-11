@@ -269,15 +269,25 @@ params:
     note: Zero delta from default. It is in the allow-list precisely so the snapshot proves it was not left disabled.
 
   NAV_DLL_ACT:
-    value: 3
+    value: 0
     type: INT32
     default: 0
     range: enum 0 to 6 -- 0 Disabled, 1 Hold mode, 2 Return mode, 3 Land mode, 5 Terminate, 6 Disarm
-    why: GCS link loss lands, for the same reason offboard loss lands; the QGC link and the uXRCE-DDS link share the network, so a dropout removes all operator oversight at once.
+    why: Disabled on purpose. Any non-zero value makes PX4 demand a MAVLink GCS heartbeat before it will arm and treat losing one as a failsafe, and in flight there is no GCS -- Aerostack2 talks uXRCE-DDS, which PX4 does not count as a GCS. The link that matters is the offboard setpoint stream, covered by COM_OBL_RC_ACT=4 (Land), plus volume_guard.
     verified: src/modules/commander/commander_params.c
     note: >-
-      Note there is no value 4 in this enum. The trigger delay is
-      COM_DL_LOSS_T, not in the allow-list and left at its factory value.
+      Was 3 (Land). Bench, 2026-09-11: with NAV_DLL_ACT=3 and no QGC
+      attached PX4 raised "Preflight Fail: No connection to the GCS" and
+      would not arm. Monday's plan has no USB and no telemetry radio, so 3
+      would block arming outright -- or, if QGC were plugged in to arm and
+      then unplugged, land the aircraft COM_DL_LOSS_T (10 s) after the
+      heartbeat stopped. Datalink loss cannot protect this aircraft: the
+      FC never sees Aerostack2 as a GCS, so the two links that do are the
+      offboard stream (COM_OBL_RC_ACT=4) and the ground-side volume_guard.
+      Already set to 0 on drone0 via the MAVLink console on 2026-09-11;
+      read it back (`param show NAV_DLL_ACT` -> 0) like every other entry.
+      There is no value 4 in this enum. The trigger delay is COM_DL_LOSS_T,
+      not in the allow-list and left at its factory value.
 
   RTL_RETURN_ALT:
     value: 2.0
