@@ -35,8 +35,26 @@ python3-rosdep                      # resolve source-package dependencies to apt
 python3-pip                         # install the offline aarch64 wheels (pymavlink, fastcrc, pyserial)
 pkg-config                          # XRCE agent's OpenSSL/spdlog discovery
 
-# --- Aerostack2 (arm64 binaries confirmed) ----------------------------------
-ros-humble-aerostack2               # the whole AS2 stack: as2_core, state estimator, controller, behaviors
+# --- Aerostack2 1.1.3, as its COMPONENT packages ---------------------------
+# The ros-humble-aerostack2 metapackage is NOT in the jammy arm64 index any
+# more (checked on the Jetson 2026-09-11 after apt-get update: "Unable to
+# locate package ros-humble-aerostack2"; the 2026-08-04 rebuild depends on
+# as2-gazebo-assets / as2-platform-gazebo / as2-visualization, which have no
+# arm64 build, and the older 20251120 metapackage was retired). It contained
+# nothing but an ament-index entry anyway. Every component below IS published
+# for arm64 at 1.1.3 and is what the Jetson actually runs (README section 1).
+ros-humble-as2-core                 # as2::AerialPlatform, node base classes -- as2_platform_pixhawk links it
+ros-humble-as2-msgs                 # as2_msgs/ControlMode, PlatformInfo, ... (1.1.3 API the O134 patch targets)
+ros-humble-as2-state-estimator      # the STOCK estimator node that loads mocap_pose_guarded::Plugin (S1)
+ros-humble-as2-motion-controller    # controller_manager + PID plugin; closes the position loop onboard
+ros-humble-as2-motion-reference-handlers # motion handlers used by the controller and the behaviours
+ros-humble-as2-behavior             # behaviour server base class
+ros-humble-as2-behaviors-motion     # takeoff / land / go_to / follow_path action servers the GS calls
+ros-humble-as2-behaviors-platform   # arm / offboard / takeoff-land platform behaviours
+ros-humble-as2-behaviors-trajectory-generation # trajectory generator behind go_to / follow_path
+ros-humble-as2-python-api           # DroneInterface (GS uses it; onboard for bench scripts and as2_cli)
+@optional ros-humble-as2-cli        # `as2` command-line helper at the bench
+@optional ros-humble-as2-alphanumeric-viewer # terminal telemetry viewer at the bench
 ros-humble-mocap4r2-msgs            # mocap4r2_msgs/RigidBodies -- the type vrpn_to_rigidbodies.py publishes
 ros-humble-vrpn-mocap              # per-drone VRPN client (see README: the mocap topology decision)
 

@@ -380,7 +380,9 @@ phase_network() {
     warn "    sudo ip addr add ${FC_LINK_IP}/24 dev ${FC_IFACE} && sudo ip link set ${FC_IFACE} up"
   fi
 
-  if [ "${DRY_RUN}" -eq 0 ] && ping -c 2 -W 2 -I "${FC_IFACE}" "${FC_IP}" >/dev/null 2>&1; then
+  # A ping is read-only, so it runs under --dry-run too: skipping it printed a
+  # misleading "no ICMP reply" warning on a dry run with the FC powered.
+  if ping -c 2 -W 2 -I "${FC_IFACE}" "${FC_IP}" >/dev/null 2>&1; then
     ok "flight controller ${FC_IP} responds on ${FC_IFACE}"
   else
     warn "no ICMP reply from ${FC_IP} on ${FC_IFACE}."
@@ -428,11 +430,12 @@ phase_network() {
   fi
 
   # 1d. can we reach the world? Determines whether phase 2 can use apt.
+  # Probed under --dry-run as well (getent + a HEAD request are read-only):
+  # leaving NET_OK at 0 on a dry run sent phase 2 down the offline path and
+  # the dry run died with "No network" on a machine that had internet.
   NET_OK=0
   if [ "${OFFLINE}" -eq 1 ]; then
     info "internet            : not probed (--offline)"
-  elif [ "${DRY_RUN}" -eq 1 ]; then
-    info "internet            : not probed (--dry-run)"
   else
     if getent hosts packages.ros.org >/dev/null 2>&1; then
       ok "DNS resolves packages.ros.org"
@@ -471,8 +474,9 @@ phase_apt() {
   [ -f "${PACKAGES_FILE}" ] || die "packages.txt not found next to this script: ${PACKAGES_FILE}"
 
   # If phase 'network' was skipped (--only apt), NET_OK is still the global 0,
-  # which would silently push this phase down the offline path. Probe here.
-  if [ "${NET_OK}" -eq 0 ] && [ "${OFFLINE}" -eq 0 ] && [ "${DRY_RUN}" -eq 0 ]; then
+  # which would silently push this phase down the offline path. Probe here
+  # (read-only, so under --dry-run too).
+  if [ "${NET_OK}" -eq 0 ] && [ "${OFFLINE}" -eq 0 ]; then
     if curl -fsS --max-time 20 -o /dev/null \
          "http://packages.ros.org/ros2/ubuntu/dists/${EXPECTED_CODENAME}/Release" 2>/dev/null; then
       NET_OK=1
@@ -664,7 +668,10 @@ phase_workspace() {
   # Provenance. The bundle records what it shipped; assert it here so a wrong
   # px4_msgs branch is caught before it becomes a runtime message mismatch.
   if [ -f "${BUNDLE_DIR}/BUNDLE_INFO.txt" ]; then
-    grep -q "px4_msgs.*${PX4_MSGS_BRANCH}" "${BUNDLE_DIR}/BUNDLE_INFO.txt" \
+    # BUNDLE_INFO.txt puts "branch : release/1.17" on its own line under the
+    # "src/px4_msgs" heading, so look inside that block rather than for both
+    # words on one line (which never matched and always WARNed).
+    grep -A4 '^src/px4_msgs' "${BUNDLE_DIR}/BUNDLE_INFO.txt" | grep -q "branch.*${PX4_MSGS_BRANCH}" \
       && ok "bundle declares px4_msgs ${PX4_MSGS_BRANCH}" \
       || warn "bundle does not declare px4_msgs branch ${PX4_MSGS_BRANCH} -- check BUNDLE_INFO.txt"
     grep -q "${PLATFORM_BASE_COMMIT}" "${BUNDLE_DIR}/BUNDLE_INFO.txt" \
@@ -711,27 +718,35 @@ phase_workspace() {
 phase_build() {
   phase_banner "4  build -- colcon"
 
-  [ -d "${WS}/src/px4_msgs" ] || die "no ${WS}/src/px4_msgs -- run phase 'workspace' first"
-  [ -f "/opt/ros/${EXPECTED_ROS_DISTRO}/setup.bash" ] || die "ROS 2 ${EXPECTED_ROS_DISTRO} is not installed -- run phase 'apt' first"
-
   if [ "${DRY_RUN}" -eq 1 ]; then
-    info "would build px4_msgs then as2_platform_pixhawk with:"
-    info "  colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF"
+    # On a dry run phase 'workspace' copied nothing, so the src/ guard below
+    # would fire and end the dry run early. Describe, and move on.
+    info "would build px4_msgs, as2_platform_pixhawk, as2_mocap_guarded (in that order) with:"
+    info "  PYTHONNOUSERSITE=1 colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF"
+    [ -d "${WS}/src/px4_msgs" ] || info "  (src/ is unpacked by phase 'workspace', which a dry run does not do)"
     return 0
   fi
+
+  [ -d "${WS}/src/px4_msgs" ] || die "no ${WS}/src/px4_msgs -- run phase 'workspace' first"
+  [ -f "/opt/ros/${EXPECTED_ROS_DISTRO}/setup.bash" ] || die "ROS 2 ${EXPECTED_ROS_DISTRO} is not installed -- run phase 'apt' first"
 
   # `set +u` is mandatory: the ROS setup scripts dereference unset variables and
   # would abort this script under `set -u`. Restore it immediately after.
   set +u
   # shellcheck disable=SC1091
   source "/opt/ros/${EXPECTED_ROS_DISTRO}/setup.bash" || { set -u; die "cannot source ROS 2 ${EXPECTED_ROS_DISTRO}"; }
+  # Aerostack2 is installed as component packages (packages.txt): the
+  # ros-humble-aerostack2 metapackage is not published for jammy arm64. What
+  # the build needs is as2_core under the already-sourced /opt/ros prefix; the
+  # metapackage's local_setup.bash only re-adds that same prefix, so source it
+  # when present and do not require it.
   if [ -f "/opt/ros/${EXPECTED_ROS_DISTRO}/share/aerostack2/local_setup.bash" ]; then
     # shellcheck disable=SC1091
-    source "/opt/ros/${EXPECTED_ROS_DISTRO}/share/aerostack2/local_setup.bash" \
-      || { set -u; die "cannot source aerostack2 -- is ros-humble-aerostack2 installed?"; }
-  else
+    source "/opt/ros/${EXPECTED_ROS_DISTRO}/share/aerostack2/local_setup.bash" || true
+  fi
+  if [ ! -d "/opt/ros/${EXPECTED_ROS_DISTRO}/share/as2_core" ]; then
     set -u
-    die "ros-humble-aerostack2 is not installed (no share/aerostack2/local_setup.bash).
+    die "ros-humble-as2-core is not installed (no share/as2_core).
       as2_platform_pixhawk will not configure without as2_core. Run phase 'apt'."
   fi
   set -u
@@ -741,7 +756,12 @@ phase_build() {
   # Build in two steps so a px4_msgs failure is not buried in platform errors.
   # -DBUILD_TESTING=OFF: ament_lint_auto is not part of ros-base, so the test
   # block cannot configure. Same flag the ground station uses.
-  local common=(--symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF)
+  # console_cohesion+ prints each package's full output once it finishes, so a
+  # failure reads as one block in the log rather than interleaved lines.
+  # (Packages are built one at a time with --packages-select; parallelism
+  # inside a package comes from colcon's default MAKEFLAGS=-j$(nproc).)
+  local common=(--symlink-install --parallel-workers "$(nproc)" --event-handlers console_cohesion+ \
+                --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF)
 
   log "building px4_msgs (this is the long one -- ~20-40 min on an Orin NX)"
   ( cd "${WS}" && PYTHONNOUSERSITE=1 colcon build --packages-select px4_msgs "${common[@]}" ) \
@@ -789,10 +809,41 @@ phase_build() {
 # by ros-humble-fastcdr (1.0.x) and ros-humble-fastrtps (2.6.x).
 # That is what makes this step work with no internet at all.
 # --------------------------------------------------------------------------- #
+agent_runs() {
+  # MicroXRCEAgent has no --help flag: v2.4.x treats it as an invalid transport,
+  # prints its usage banner and exits 1 (measured on the Jetson). A loader
+  # failure also exits non-zero but prints no banner. So: exit 0, or a usage
+  # banner, both mean "the binary loads and executes".
+  # The banner contains a NUL byte, which bash's command substitution warns
+  # about; strip it, keeping the agent's own exit status.
+  local out
+  out="$(LD_LIBRARY_PATH="${XRCE_PREFIX}/lib:${LD_LIBRARY_PATH:-}" "$1" --help 2>&1 | tr -d '\0'; exit "${PIPESTATUS[0]}")" && return 0
+  printf '%s' "${out}" | grep -qi 'usage'
+}
+
 phase_agent() {
   phase_banner "5  agent -- Micro-XRCE-DDS-Agent ${XRCE_TAG}"
 
   local bin="${XRCE_PREFIX}/bin/MicroXRCEAgent"
+
+  # An agent already on PATH (e.g. one built by hand into /usr/local/bin, as on
+  # the first Jetson) is used as-is. This kit does not rebuild what already
+  # works, and setup_env.sh only PREPENDS ${XRCE_PREFIX}/bin, so a system-wide
+  # binary stays reachable. verify_jetson.sh looks on PATH first for the same
+  # reason.
+  if [ ! -x "${bin}" ] && command -v MicroXRCEAgent >/dev/null 2>&1; then
+    local sysbin; sysbin="$(command -v MicroXRCEAgent)"
+    ok "MicroXRCEAgent already on PATH: ${sysbin} -- not rebuilding into ${XRCE_PREFIX}"
+    if [ "${DRY_RUN}" -eq 0 ]; then
+      if agent_runs "${sysbin}"; then
+        ok "the binary runs"
+      else
+        warn "${sysbin} is present but would not run -- fix it or remove it from PATH, then re-run this phase to build ${XRCE_TAG}"
+      fi
+    fi
+    return 0
+  fi
+
   if [ -x "${bin}" ]; then
     ok "already built: ${bin}"
     if [ "${DRY_RUN}" -eq 0 ]; then
@@ -800,7 +851,7 @@ phase_agent() {
       # shellcheck disable=SC1091
       source "/opt/ros/${EXPECTED_ROS_DISTRO}/setup.bash" >/dev/null 2>&1 || true
       set -u
-      LD_LIBRARY_PATH="${XRCE_PREFIX}/lib:${LD_LIBRARY_PATH:-}" "${bin}" --help >/dev/null 2>&1 \
+      agent_runs "${bin}" \
         && ok "the binary runs" \
         || warn "the binary is present but would not run -- delete ${XRCE_PREFIX} and re-run this phase"
     fi
@@ -862,7 +913,7 @@ phase_agent() {
   ( cd "${XRCE_PREFIX}/build" && make install ) || die "agent install failed"
 
   [ -x "${bin}" ] || die "build succeeded but ${bin} is missing"
-  LD_LIBRARY_PATH="${XRCE_PREFIX}/lib:${LD_LIBRARY_PATH:-}" "${bin}" --help >/dev/null 2>&1 \
+  agent_runs "${bin}" \
     || die "${bin} will not run -- check LD_LIBRARY_PATH and ldd ${bin}"
   ok "MicroXRCEAgent built and runs: ${bin}"
   info "  it will be started by hand, without sudo:  MicroXRCEAgent udp4 -p ${XRCE_PORT}"
@@ -956,7 +1007,15 @@ case "\$-" in *u*) _o134_had_u=1 ;; esac
 set +u
 
 . /opt/ros/${EXPECTED_ROS_DISTRO}/setup.bash
-. /opt/ros/${EXPECTED_ROS_DISTRO}/share/aerostack2/local_setup.bash
+# Aerostack2 is installed as component packages under the same prefix (the
+# metapackage is not published for jammy arm64); its local_setup.bash is
+# optional and only re-adds /opt/ros/${EXPECTED_ROS_DISTRO}.
+if [ -f /opt/ros/${EXPECTED_ROS_DISTRO}/share/aerostack2/local_setup.bash ]; then
+  . /opt/ros/${EXPECTED_ROS_DISTRO}/share/aerostack2/local_setup.bash
+fi
+if [ ! -d /opt/ros/${EXPECTED_ROS_DISTRO}/share/as2_core ]; then
+  echo "setup_env.sh: WARNING ros-humble-as2-core is not installed" >&2
+fi
 if [ -f "${WS}/install/setup.bash" ]; then
   . "${WS}/install/setup.bash"
 else

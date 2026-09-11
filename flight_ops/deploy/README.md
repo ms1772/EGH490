@@ -187,8 +187,8 @@ Checked against the ROS 2 build farm, not assumed.
 
 | Package | arm64 jammy Humble deb? | Evidence |
 |---|---|---|
-| `ros-humble-aerostack2` | **YES** | `Hbin_ujv8_uJv8__aerostack2__ubuntu_jammy_arm64__binary` — last build #186, success |
-| `ros-humble-as2-state-estimator` | **YES** | same job family, #116, success |
+| `ros-humble-aerostack2` (metapackage) | **NO — not any more** | Was #186 success; on 2026-09-11 the Jetson's `apt-get update` index no longer carries it (`Unable to locate package`). Its `as2-gazebo-assets` / `as2-platform-gazebo` / `as2-visualization` deps have no arm64 build. It contained only an ament-index entry, so `packages.txt` now lists the `ros-humble-as2-*` components instead. |
+| `ros-humble-as2-core`, `-msgs`, `-state-estimator`, `-motion-controller`, `-behaviors-*`, `-python-api` | **YES** | all present at 1.1.3 (`1.1.3-1jammy.20260804.*`) in the arm64 index, installed on the first Jetson |
 | `ros-humble-vrpn-mocap` | **YES** | #91, success |
 | `ros-humble-mocap4r2-msgs` | **YES** | #64, success |
 | `ros-humble-ros-base`, `rmw-cyclonedds-cpp` | **YES** | ROS 2 core; jammy arm64 is a first-class target |
