@@ -99,7 +99,13 @@ managed_params:
 
 # Hosts that snapshot.py will try to reach over ssh (BatchMode only -- set up
 # key auth first; no password is ever stored in this repo).
+#
+# addr is a DHCP LEASE on the lab wifi, not a fixed address. 10.88.38.136 is
+# what hostname `jetsonorinnx` (drone0's Orin NX) held on 2026-09-11; the
+# earlier 10.88.51.230 was the same machine's previous lease. Confirm with
+# `hostname -I` on the Jetson before a session; a stale value here only
+# makes snapshot.py's ssh time out (harmless, but noisy).
 hosts:
-  - name: jetson-drone3
+  - name: jetsonorinnx-drone0
     user: jetson
-    addr: 10.88.51.230
+    addr: 10.88.38.136

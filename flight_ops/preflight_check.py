@@ -119,20 +119,38 @@ DEFAULT_TF_TOL_M = 0.01
 DEFAULT_TF_TOL_DEG = 1.0
 
 # --- PX4 / uXRCE-DDS -------------------------------------------------------
-# Verified against PX4 v1.17 dds_topics.yaml. These are the unversioned names
-# the bridge advertises; do NOT append `_v1`.
+# The endpoint pairs between the PATCHED as2_platform_pixhawk (base 2b00b77 +
+# flight_ops/patches/as2_platform_pixhawk_o134.patch) and the flight
+# controller. `dds_link` demands a MATCHED endpoint on each -- a publisher and
+# a subscriber -- so this list must be exactly what the platform creates
+# (pixhawk_platform.cpp, the constructor) against what PX4 v1.17.0 exposes,
+# and nothing else. Every /fmu/out topic here has a platform SUBSCRIBER;
+# every /fmu/in topic has a platform PUBLISHER.
+#
+# NOT listed, on purpose: /fmu/out/timesync_status. The base commit already
+# ships the platform's TimesyncStatus subscription commented out, so nothing
+# on the aircraft ever subscribes to it. Requiring it made dds_link RED on
+# every hardware bringup (measured 2026-09-11: "no matched endpoint:
+# /uav_0/fmu/out/timesync_status (pub=1, sub=0)") -- a FAIL row the crew
+# would have learned to ignore. verify_jetson.sh still reads its rate, as a
+# data-flow probe against the agent alone, which is a different question.
+#
+# Names as MEASURED on the FC (PX4 v1.17.0, 11 Sept 2026): messages carrying
+# a MESSAGE_VERSION are published/subscribed with a _v1 suffix
+# (battery_status_v1, vehicle_attitude_setpoint_v1); the rest are bare.
+# dds_topics.yaml shows base names only and cannot be used to decide this.
 DEFAULT_FMU_TOPICS = (
-    "/fmu/out/vehicle_odometry",
-    "/fmu/out/vehicle_control_mode",
-    # MEASURED on the FC (PX4 v1.17, 11 Sept 2026): battery_status carries a
-    # MESSAGE_VERSION and is published as battery_status_v1. Eight of the 65
-    # topics are versioned; the rest of this list is not. dds_topics.yaml
-    # shows base names only and cannot be used to decide this.
-    "/fmu/out/battery_status_v1",
+    # FC -> platform (platform subscribes)
     "/fmu/out/sensor_combined",
-    "/fmu/out/timesync_status",
-    "/fmu/in/trajectory_setpoint",
+    "/fmu/out/vehicle_control_mode",
+    "/fmu/out/vehicle_gps_position",
+    "/fmu/out/battery_status_v1",
+    "/fmu/out/vehicle_odometry",
+    # platform -> FC (platform publishes)
     "/fmu/in/offboard_control_mode",
+    "/fmu/in/trajectory_setpoint",
+    "/fmu/in/vehicle_attitude_setpoint_v1",
+    "/fmu/in/vehicle_rates_setpoint",
     "/fmu/in/vehicle_command",
     "/fmu/in/vehicle_visual_odometry",
 )
@@ -1570,6 +1588,25 @@ def self_test() -> int:
               "/fmu/in/trajectory_setpoint", "/fmu/in/offboard_control_mode",
               "/fmu/in/vehicle_command", "/fmu/in/vehicle_visual_odometry",
               "/fmu/out/vehicle_odometry")))
+    check("vehicle_attitude_setpoint is the versioned name the FC subscribes to",
+          "/fmu/in/vehicle_attitude_setpoint_v1" in DEFAULT_FMU_TOPICS
+          and "/fmu/in/vehicle_attitude_setpoint" not in DEFAULT_FMU_TOPICS)
+    # The patched platform never subscribes to timesync_status (the base
+    # commit ships that subscription commented out), so a matched endpoint on
+    # it is impossible and requiring one made dds_link RED by construction on
+    # hardware (2026-09-11).
+    check("timesync_status is NOT required: the platform has no subscriber for it",
+          "/fmu/out/timesync_status" not in DEFAULT_FMU_TOPICS)
+    check("every required /fmu/out topic is one the platform subscribes to, "
+          "and every /fmu/in one it publishes",
+          [t for t in DEFAULT_FMU_TOPICS if t.startswith("/fmu/out/")] == [
+              "/fmu/out/sensor_combined", "/fmu/out/vehicle_control_mode",
+              "/fmu/out/vehicle_gps_position", "/fmu/out/battery_status_v1",
+              "/fmu/out/vehicle_odometry"]
+          and [t for t in DEFAULT_FMU_TOPICS if t.startswith("/fmu/in/")] == [
+              "/fmu/in/offboard_control_mode", "/fmu/in/trajectory_setpoint",
+              "/fmu/in/vehicle_attitude_setpoint_v1", "/fmu/in/vehicle_rates_setpoint",
+              "/fmu/in/vehicle_command", "/fmu/in/vehicle_visual_odometry"])
 
     print("check selection")
     check("default selects everything", select_checks(CHECK_NAMES, None, None)
