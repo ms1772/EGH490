@@ -393,6 +393,14 @@ def main() -> None:
                         help="Which path key to load from the pkl (default: deckga_paths).")
     parser.add_argument("--num_uavs", type=int, default=3)
     parser.add_argument("--uav_prefix", default="drone")
+    parser.add_argument("--path_index", type=int, default=0,
+                        help="Which path of the plan to start from (default: 0). "
+                             "With --num_uavs 1 this selects a SINGLE path, so one "
+                             "aircraft can fly a multi-UAV plan one path at a time: "
+                             "--path_index 0, then 1, then 2. The selection happens "
+                             "AFTER the coordinate transform, so the path flown is "
+                             "geometrically identical to what a full multi-drone run "
+                             "would fly.")
 
     parser.add_argument("--frame_id", default=DEFAULT_FRAME_ID)
     parser.add_argument("--speed", type=float, default=DEFAULT_SPEED)
@@ -407,7 +415,10 @@ def main() -> None:
     parser.add_argument("--takeoff_z", type=float, default=DEFAULT_TAKEOFF_Z)
     parser.add_argument("--hover_s", type=float, default=DEFAULT_HOVER_S)
     parser.add_argument("--land_settle_s", type=float, default=DEFAULT_LAND_SETTLE_S)
-    parser.add_argument("--takeoff_sequential", action="store_true")
+    parser.add_argument("--takeoff_sequential", action="store_true",
+                        help="Accepted for backward compatibility and ignored: "
+                             "takeoff is always one aircraft at a time, each "
+                             "blocking until it reports the commanded height.")
     parser.add_argument("--first_wp_wait", action="store_true", help="Handshake to first waypoint with wait=True (recommended).")
 
     # Transform controls
@@ -450,7 +461,6 @@ def main() -> None:
         print(f"Loading paths ({args.path_key}): {args.deckga_pkl}")
         raw_paths, offset_used = load_deckga_pkl(args.deckga_pkl, path_key=args.path_key)
 
-        raw_paths = raw_paths[: len(namespaces)]
         tf = TransformConfig(
             coord_mode=str(args.coord_mode),
             scale_xy=float(args.scale_xy),
@@ -459,7 +469,33 @@ def main() -> None:
             z_min=float(args.z_min),
         )
 
-        paths_m = transform_paths(raw_paths, offset_used, tf)
+        # Transform ALL paths, then select. Do not slice raw_paths first:
+        # transform_paths -> _auto_is_shifted() inspects every path stacked
+        # together, so transforming a 1-path slice can reach a different
+        # shifted/original verdict than the full plan would, and silently move
+        # the aircraft somewhere else. Selecting afterwards guarantees the path
+        # flown here is identical to the one a full multi-drone run would fly.
+        paths_all = transform_paths(raw_paths, offset_used, tf)
+
+        idx = int(args.path_index)
+        if idx < 0 or idx >= len(paths_all):
+            raise SystemExit(
+                f"--path_index {idx} is out of range: the plan in "
+                f"{args.deckga_pkl} has {len(paths_all)} path(s) under "
+                f"'{args.path_key}' (valid indices 0..{len(paths_all) - 1})."
+            )
+        if idx + len(namespaces) > len(paths_all):
+            raise SystemExit(
+                f"--path_index {idx} with --num_uavs {len(namespaces)} needs "
+                f"{idx + len(namespaces)} paths but the plan has "
+                f"{len(paths_all)}. Reduce --num_uavs or --path_index."
+            )
+
+        paths_m = paths_all[idx: idx + len(namespaces)]
+        if idx != 0 or len(paths_m) != len(paths_all):
+            print(f"Flying path(s) {idx}..{idx + len(paths_m) - 1} "
+                  f"of {len(paths_all)} in the plan "
+                  f"({args.path_key}) on: {', '.join(namespaces)}")
 
         planned_lengths, planned_times_s, planned_makespan = planned_times(paths_m, args.speed)
         print("\n=== Planned timing (kinematic model) ===")
@@ -491,14 +527,14 @@ def main() -> None:
 
         # Takeoff
         t_takeoff_start = time.perf_counter()
-        if args.takeoff_sequential:
-            print(f"Taking off SEQUENTIALLY to {float(args.takeoff_z):.2f} m (wait=True)...")
-            for d in drones:
-                safe_takeoff(d, height=float(args.takeoff_z), wait=True)
-        else:
-            print(f"Taking off ALL drones to {float(args.takeoff_z):.2f} m (wait=True)...")
-            for d in drones:
-                safe_takeoff(d, height=float(args.takeoff_z), wait=True)
+        # Takeoff is ALWAYS one aircraft at a time, each blocking until it
+        # reports the commanded height. Both branches of the old
+        # --takeoff_sequential test did exactly this and differed only in what
+        # they printed, so the flag promised a choice that did not exist.
+        print(f"Taking off to {float(args.takeoff_z):.2f} m, "
+              f"one at a time, blocking (wait=True)...")
+        for d in drones:
+            safe_takeoff(d, height=float(args.takeoff_z), wait=True)
         t_takeoff_end = time.perf_counter()
 
         print(f"Takeoff settle wait: {float(args.takeoff_settle_s):.1f}s")
@@ -507,14 +543,40 @@ def main() -> None:
         # First waypoint handshake (recommended for crisp tracking)
         t_handshake_start = time.perf_counter()
         if args.first_wp_wait:
-            print("First-waypoint handshake (wait=True per drone)...")
-            for i, d in enumerate(drones):
-                p = paths_m[i]
+            # THREADED, one per aircraft, exactly like the main path loop below.
+            #
+            # This used to be a serial `for` with wait=True while the mission
+            # itself was threaded, so the fleet flew to its first waypoints one
+            # aircraft at a time. Measured on a 3-UAV n=100 trial:
+            # handshake_s = 199.5 s, i.e. the SUM of three transits rather than
+            # the longest. Threading recovers roughly 130 s per trial, which is
+            # about three hours across an 80-trial campaign, and changes
+            # nothing about what is flown -- each aircraft goes to its own
+            # first waypoint either way.
+            #
+            # These transits are independent by construction: each drone flies
+            # to a different cluster's start, and no aircraft's first waypoint
+            # depends on another having arrived.
+            print("First-waypoint handshake (wait=True per drone, in parallel)...")
+
+            def _first_wp(idx: int, drone: DroneInterface) -> None:
+                p = paths_m[idx]
                 if len(p) == 0:
-                    continue
+                    return
                 x, y, z = map(float, p[0])
-                print(f"[{namespaces[i]}] FIRST WP (blocking) -> (x={x:.2f}, y={y:.2f}, z={z:.2f})")
-                safe_go_to(d, x, y, z, float(args.speed), str(args.frame_id), wait=True)
+                print(f"[{namespaces[idx]}] FIRST WP (blocking) -> "
+                      f"(x={x:.2f}, y={y:.2f}, z={z:.2f})")
+                safe_go_to(drone, x, y, z, float(args.speed),
+                           str(args.frame_id), wait=True)
+
+            hs_threads = [
+                threading.Thread(target=_first_wp, args=(i, d), daemon=True)
+                for i, d in enumerate(drones)
+            ]
+            for th in hs_threads:
+                th.start()
+            for th in hs_threads:
+                th.join()
             time.sleep(1.0)
         t_handshake_end = time.perf_counter()
 

@@ -90,6 +90,26 @@ def main() -> None:
     ap.add_argument("--out_raw_pkl", default=None, help="Optional RAW (unscaled) PKL path.")
     ap.add_argument("--out_raw_txt", default=None, help="Optional RAW (unscaled) TXT path.")
 
+    # Rejection sampling, for generating OBSTACLES that do not swallow waypoints.
+    #
+    # DECK_GA_QuickNav.py:242-259 rejects the whole scene if any waypoint or
+    # start point falls inside an obstacle AABB, and the test is INCLUSIVE (a
+    # point exactly on a face fails). At M=100 roughly 4.5 of 100 waypoints land
+    # inside an obstacle by chance, so the sweep's four retries all fail and the
+    # trial is recorded as skipped_overlap. Without this flag the dense arms of
+    # the campaign simply do not run.
+    ap.add_argument("--exclude_pkl", default=None,
+                    help="Nx3 pickle of points that generated boxes must not contain. "
+                         "Pass the waypoint pickle when generating obstacles.")
+    ap.add_argument("--exclude_halfsize", type=float, default=None,
+                    help="Half-size of the box drawn around each generated point when "
+                         "testing containment. Use the planner's obs_size.")
+    ap.add_argument("--exclude_margin", type=float, default=0.0,
+                    help="Extra clearance added to the half-size when rejecting. "
+                         "Keeps points off the face, where the inclusive test trips.")
+    ap.add_argument("--max_redraws", type=int, default=1000,
+                    help="Per-point redraw cap before giving up loudly. Default %(default)s.")
+
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -99,11 +119,43 @@ def main() -> None:
     ymin, ymax = float(args.y[0]), float(args.y[1])
     zmin, zmax = float(args.z[0]), float(args.z[1])
 
-    points_raw = np.column_stack([
-        rng.uniform(xmin, xmax, size=n),
-        rng.uniform(ymin, ymax, size=n),
-        rng.uniform(zmin, zmax, size=n),
-    ]).astype(float)
+    if args.exclude_pkl is None:
+        points_raw = np.column_stack([
+            rng.uniform(xmin, xmax, size=n),
+            rng.uniform(ymin, ymax, size=n),
+            rng.uniform(zmin, zmax, size=n),
+        ]).astype(float)
+    else:
+        if args.exclude_halfsize is None:
+            raise SystemExit("--exclude_pkl requires --exclude_halfsize")
+        with Path(args.exclude_pkl).expanduser().open("rb") as f:
+            excl = np.asarray(pickle.load(f), dtype=float).reshape(-1, 3)
+        half = float(args.exclude_halfsize) + float(args.exclude_margin)
+
+        # Draw one centre at a time and reject any that would contain an
+        # excluded point. Per-point rather than per-batch so a single awkward
+        # obstacle cannot force the whole set to be redrawn.
+        kept = np.empty((n, 3), dtype=float)
+        total_redraws = 0
+        for i in range(n):
+            for attempt in range(args.max_redraws):
+                c = np.array([rng.uniform(xmin, xmax),
+                              rng.uniform(ymin, ymax),
+                              rng.uniform(zmin, zmax)])
+                if not np.any(np.all(np.abs(excl - c) <= half, axis=1)):
+                    kept[i] = c
+                    total_redraws += attempt
+                    break
+            else:
+                raise SystemExit(
+                    f"could not place box {i + 1}/{n} in {args.max_redraws} draws "
+                    f"with half-size {half:g} against {len(excl)} excluded points. "
+                    f"The scene is too dense for this obstacle size -- lower the "
+                    f"count or the size rather than loosening the test."
+                )
+        points_raw = kept
+        print(f"rejection sampling: {n} boxes placed, {total_redraws} redraws, "
+              f"half-size {half:g}, {len(excl)} excluded points")
 
     scale_xy = float(args.scale_xy)
     scale_z = float(args.scale_z)

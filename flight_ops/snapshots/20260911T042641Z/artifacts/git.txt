@@ -1,0 +1,7 @@
+HEAD    66c3477dc3f5efb8b5f119afc7b8be455d7daa9c
+branch  docs/runsheets
+dirty   yes
+
+?? flight_ops/rqt_export.py
+?? flight_ops/rqt_gui_shot.py
+?? flight_ops/snapshots/20260911T042633Z/

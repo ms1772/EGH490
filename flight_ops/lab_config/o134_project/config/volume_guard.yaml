@@ -40,18 +40,32 @@
     # stop before it touches netting.
     box_size_m: [8.0, 6.0, 4.0]
 
-    # MUST BE DETERMINED -- README.md, MBD-5.
-    # (0, 0, 0) says the mocap origin is at the CENTRE of the volume,
-    # including vertically, i.e. z = 0 is 2 m above the floor. If Motive's
-    # origin is instead set on the floor, this must become [0.0, 0.0, 2.0]
-    # or the ceiling half of the fence lands underground and the floor half
-    # is unprotected. Measure it in Motive on the first lab visit; it is a
-    # ten-second check and getting it wrong disables half the fence.
+    # MBD-5: RESOLVED 2026-09-17 by measurement, was [0.0, 0.0, 0.0].
+    #
+    # Motive's origin is on the FLOOR, not at the centre of the volume. Bag
+    # monday_1246, aircraft stationary on the pad, 940 samples:
+    # z = +0.2703 m with a 4 mm spread. A centred origin would have put the
+    # resting aircraft at about z = -2.
+    #
+    # With the old [0, 0, 0] the fence was |z| < 1.5 about a point 2 m in the
+    # air: the ceiling half sat underground and the floor half was
+    # unprotected, which is the exact failure the original comment warned
+    # about. [0, 0, 2] puts the fence at 0.5 < z < 3.5, which is the netted
+    # volume.
+    #
+    # The xy centre is a separate question and is NOT resolved. Bag
+    # monday_1235 (a perimeter walk, drone in hand) traces x -3.83..+2.30 and
+    # y -3.75..-1.25, which no 8 x 6 m box centred on the origin contains --
+    # so the origin is not the room centre in xy either, and box_size_m /
+    # box_center_m above are still nominal in x and y. Measure the four
+    # corners in Motive and set them. Until then the fence is generous in xy
+    # and correct in z, and flight_ops/lab_config/o134_mission/ keeps every
+    # commanded waypoint inside the region that was actually walked.
     #
     # This must agree with the earth_to_map_* values in
     # config/mocap_pose_guarded.yaml, which are identity, and with
     # box_center_m in config/fake_mocap_r1.yaml.
-    box_center_m: [0.0, 0.0, 0.0]
+    box_center_m: [0.0, 0.0, 2.0]
     fence_margin_m: 0.5
 
     # -- staleness --------------------------------------------------------

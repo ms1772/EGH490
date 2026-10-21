@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -55,15 +56,63 @@ POST_READY_SETTLE_S = 10
 # Worst-case mission: n=100 wp at speed=1.0 m/s. Empirically the makespan can
 # hit ~18 min for n=100 (drones not perfectly parallel). 30 min gives safe
 # margin. Overridable from sweep_gazebo CLI.
-EXECUTOR_BACKSTOP_S = 1800
+# 3600, not 1800: the measured EASIEST condition already takes 1291 s, and
+# the campaign's worst (n=100, obs=100, 3 UAVs) is several times that. A
+# backstop that fires on a healthy trial destroys data that was about to
+# land, which is worse than waiting. The per-trial wall-clock guard in the
+# campaign driver is the real runaway protection.
+EXECUTOR_BACKSTOP_S = 3600
 EXECUTOR_SIGINT_GRACE_S = 10
 EXECUTOR_SIGTERM_GRACE_S = 5
 TEARDOWN_SETTLE_S = 3
+# Recorded IN ADDITION to the pose topics when they exist. The point is that
+# anything in the bag can be re-rendered offline afterwards, which is what
+# "never re-run a simulation for a picture" actually requires: /tf + /tf_static
+# allow frame-correct replay, and the two /deckga marker topics carry the
+# planned paths and obstacle boxes that an RViz figure needs. Bags are 21-33 MB
+# today and these add little.
+#
+# Filtered against `ros2 topic list` before use -- in headless mode the marker
+# nodes are not launched, so naming them unconditionally would ask rosbag2 to
+# record topics that have no publisher.
+BAG_EXTRA_TOPICS = [
+    "/tf",
+    "/tf_static",
+    "/deckga/markers",
+    "/deckga/obstacles",
+]
+
 DEFAULT_POSE_TOPICS = [
     "/drone0/self_localization/pose",
     "/drone1/self_localization/pose",
     "/drone2/self_localization/pose",
 ]
+
+# --- real-time factor -------------------------------------------------------
+# The world template pins the sim to real time:
+#   /opt/ros/humble/share/as2_gazebo_assets/worlds/empty.sdf.jinja:6-7
+#     <max_step_size>0.004</max_step_size>
+#     <real_time_factor>1.0</real_time_factor>
+# That is a configured throttle, not a CPU limit -- an empty world with three
+# quadrotors does not come close to saturating 20 cores.
+#
+# It can be lifted at RUNTIME, with no file edited anywhere: the world loads
+# ignition-gazebo-user-commands-system, which serves /world/<name>/set_physics.
+# Measured on a bare world: RTF 1.0 -> 10.0 immediately, service returns
+# data: true.
+#
+# NOTE real_time_factor: 0.0 is NOT "unlimited" -- it is silently ignored and
+# the sim stays at 1.0. Always pass an explicit positive value.
+#
+# Whether the FULL stack tolerates it is a different question and must be
+# measured, not assumed: config/config.yaml:11,25 run the platform and
+# controller at cmd_freq 50 Hz against use_sim_time, so at RTF N they must
+# sustain 50*N Hz of wall-clock work. If they cannot, tracking degrades and the
+# results change. See the Stage 0 calibration.
+GZ_WORLD_NAME = "empty"
+DEFAULT_RTF = 1.0
+RTF_SETTLE_S = 2.0
+PHYSICS_MAX_STEP_SIZE = 0.004
 
 
 @dataclass
@@ -145,6 +194,60 @@ def wait_for_clock(timeout_s: float = READINESS_CLOCK_TIMEOUT_S, poll_s: float =
     return False
 
 
+def set_real_time_factor(rtf: float, world: str = GZ_WORLD_NAME,
+                         timeout_ms: int = 3000) -> bool:
+    """Ask Gazebo to run at `rtf` x real time. Returns True if it accepted.
+
+    Must be called AFTER the world is up (wait_for_clock) -- the service does
+    not exist before then.
+    """
+    _require_unix()
+    if rtf is None or float(rtf) <= 0.0:
+        raise ValueError(
+            f"real_time_factor must be a positive number, got {rtf!r}. "
+            f"0.0 does not mean 'unlimited' -- Gazebo ignores it and stays at 1.0."
+        )
+    req = f"real_time_factor: {float(rtf)}, max_step_size: {PHYSICS_MAX_STEP_SIZE}"
+    try:
+        proc = subprocess.run(
+            ["ign", "service", "-s", f"/world/{world}/set_physics",
+             "--reqtype", "ignition.msgs.Physics",
+             "--reptype", "ignition.msgs.Boolean",
+             "--timeout", str(timeout_ms), "--req", req],
+            capture_output=True, text=True, timeout=timeout_ms / 1000.0 + 5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+    return "data: true" in proc.stdout
+
+
+def measure_real_time_factor(world: str = GZ_WORLD_NAME, samples: int = 4,
+                             gap_s: float = 1.0) -> Optional[float]:
+    """Median achieved RTF from /world/<world>/stats, or None if unavailable.
+
+    Median rather than mean: the first sample after a physics change is often
+    a transient, and one outlier should not decide whether an RTF is accepted.
+    """
+    _require_unix()
+    vals: List[float] = []
+    for _ in range(samples):
+        try:
+            proc = subprocess.run(
+                ["ign", "topic", "-e", "-t", f"/world/{world}/stats", "-n", "1"],
+                capture_output=True, text=True, timeout=8,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            break
+        m = re.search(r"real_time_factor:\s*([0-9.]+)", proc.stdout)
+        if m:
+            vals.append(float(m.group(1)))
+        time.sleep(gap_s)
+    if not vals:
+        return None
+    vals.sort()
+    return vals[len(vals) // 2]
+
+
 def discover_pose_topics(num_uavs: int = 3) -> List[str]:
     """List ros2 topics, return any '*/self_localization/pose' for the expected drones.
     Falls back to DEFAULT_POSE_TOPICS if grep returns nothing."""
@@ -180,13 +283,31 @@ def _bag_home_dir(run_ts: str, trial_id: str) -> Path:
     return p / "poses.bag"
 
 
+def _filter_existing_topics(candidates: List[str], timeout_s: float = 10.0) -> List[str]:
+    """Keep only candidates that currently have a publisher.
+
+    Asking rosbag2 to record a topic nobody publishes is not fatal, but it is
+    not verified to be harmless either, and the bag recorder failing would void
+    a trial's entire dataset. Checking costs one `ros2 topic list`.
+    """
+    try:
+        proc = subprocess.run(["ros2", "topic", "list"], capture_output=True,
+                              text=True, timeout=timeout_s)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+    live = {t.strip() for t in proc.stdout.splitlines() if t.strip()}
+    return [t for t in candidates if t in live]
+
+
 def start_bag_recorder(topics: List[str], run_ts: str, trial_id: str,
                        log_path: Path) -> tuple[subprocess.Popen, Path]:
     bag_dir = _bag_home_dir(run_ts, trial_id)
     if bag_dir.exists():
         shutil.rmtree(bag_dir, ignore_errors=True)
     bag_dir.parent.mkdir(parents=True, exist_ok=True)
-    cmd = ["ros2", "bag", "record", "-o", str(bag_dir), *topics]
+    extra = _filter_existing_topics(BAG_EXTRA_TOPICS)
+    all_topics = list(topics) + [t for t in extra if t not in topics]
+    cmd = ["ros2", "bag", "record", "-o", str(bag_dir), *all_topics]
     proc = _spawn_bg(cmd, cwd=Path.cwd(), log_path=log_path)
     return proc, bag_dir
 

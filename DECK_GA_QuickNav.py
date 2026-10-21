@@ -142,6 +142,248 @@ def maybe_save_fig(fig, save_dir, name: str):
 
 
 # ----------------------------
+# Campaign arms
+# ----------------------------
+
+def _run_arm(*, args, points, start_points, obstacle_xyz, obs_size,
+             num_uavs, arm_label):
+    """Allocation + ordering for the non-legacy arms.
+
+    Everything here works in ORIGINAL coordinates and carries node INDICES, not
+    coordinates. Both are deliberate:
+
+    * Original coordinates, because the cost matrix must be built where the
+      obstacles actually are. DECK_GA_QuickNav shifts waypoints into positive
+      space but leaves obstacles untouched; Euclidean distance survives that
+      translation so it has never mattered, but detour cost does not. Building
+      the matrix in shifted space does not raise -- it makes every pair look
+      clear, and the obstacle-aware arms silently become the Euclidean ones.
+      `assert_detours_found` below is the tripwire.
+
+    * Indices, because the published path loses them immediately
+      (manual_kmeans_clustering returns point arrays, DCKmeans.py:69) and
+      recovering them later means matching float triples.
+
+    Node layout matches `all_in` in the legacy path exactly:
+        index i             -> start point i        (i < num_uavs)
+        index num_uavs + j  -> waypoint j
+
+    Returns (deckga_paths, dega_lengths, raw_lengths, centroids, labels,
+             uav_of_cluster, n_unreachable, cost_meta, stage_times).
+    """
+    import numpy as _np
+
+    from planner import balance as _balance
+    from planner import cost_matrix as _cm
+    from planner import kmedoids as _km
+    from planner import timing as _timing
+    from planner import tour as _tour
+
+    if args.cluster != "kmedoids":
+        # This path is k-medoids by construction: it needs labels and a
+        # precomputed cost matrix, neither of which DCKmeans provides. Rather
+        # than silently substituting the clusterer the caller did not ask for,
+        # refuse. The five campaign arms never need kmeans off the legacy path.
+        raise ValueError(
+            f"--cluster {args.cluster} is only supported on the legacy path "
+            f"(all other campaign flags at their defaults). Combining it with "
+            f"--cost {args.cost} / --objective {args.objective} is not a "
+            f"defined arm; use --cluster kmedoids."
+        )
+
+    st = {}
+    rng = _np.random.default_rng(args.planner_seed
+                                 if args.planner_seed is not None else 0)
+    tm = (_timing.TimeModel.parse(args.time_model) if args.time_model
+          else _timing.GAZEBO_SPEED1)
+
+    nodes = _np.vstack([start_points, points])
+    start_nodes = _np.arange(num_uavs)
+    wp_nodes = _np.arange(num_uavs, num_uavs + len(points))
+
+    # ---- cost matrix ----------------------------------------------------
+    t0 = time.time()
+    cost = _cm.load_or_build(
+        args.cost, nodes, obstacle_xyz, obs_size,
+        cache_dir=args.cost_cache_dir,
+    )
+    st["cost_matrix_s"] = time.time() - t0
+
+    # The node layout is load-bearing: index i is start i, index num_uavs + j is
+    # waypoint j, matching `all_in` on the legacy path. Every lookup below
+    # (start_nodes, wp_nodes, medoids_global) assumes it. A matrix of the wrong
+    # size means the layout assumption is broken and the indices address the
+    # wrong points -- which produces a plausible-looking plan for the wrong
+    # scene rather than an error.
+    n_expected = num_uavs + len(points)
+    if cost.length.shape != (n_expected, n_expected):
+        raise AssertionError(
+            f"cost matrix is {cost.length.shape}, expected "
+            f"{(n_expected, n_expected)} for {num_uavs} start(s) + "
+            f"{len(points)} waypoint(s)"
+        )
+    cost.assert_detours_found(len(obstacle_xyz))
+    print(f"\nCost matrix ({args.cost}) in {st['cost_matrix_s']:.1f} s: "
+          f"{cost.meta.get('n_detour_edges', 0)} detour edge(s), "
+          f"{cost.meta.get('n_infeasible_edges', 0)} infeasible, "
+          f"cache_hit={cost.meta.get('cache_hit')}")
+
+    # A waypoint that cannot be reached from anything pins whichever UAV owns
+    # it as permanently critical and makes a min-max balancer thrash. The
+    # planner's own overlap check catches "inside a box" but not "walled in by
+    # boxes"; measured 5 such nodes at n=100 with 100 obstacles.
+    all_unreachable = [int(i) for i in cost.unreachable_nodes()]
+    bad_starts = [i for i in all_unreachable if i < num_uavs]
+    if bad_starts:
+        raise ValueError(
+            f"UNREACHABLE WAYPOINTS: start point(s) {bad_starts} have no feasible "
+            f"edge to anything. A UAV that cannot leave its start cannot fly the "
+            f"mission; the scene or the start points are wrong."
+        )
+    unreachable = [i for i in all_unreachable if i >= num_uavs]
+    if unreachable:
+        print(f"UNREACHABLE WAYPOINTS: dropping {len(unreachable)} node(s) "
+              f"that no feasible edge reaches: {unreachable[:8]}")
+        wp_nodes = _np.array([n for n in wp_nodes if n not in set(unreachable)])
+        if len(wp_nodes) < num_uavs:
+            raise ValueError(
+                f"UNREACHABLE WAYPOINTS: only {len(wp_nodes)} reachable waypoint(s) "
+                f"remain for {num_uavs} UAVs. The scene is too dense to plan."
+            )
+
+    # ---- allocation ------------------------------------------------------
+    t0 = time.time()
+    sub = cost.length[_np.ix_(wp_nodes, wp_nodes)]
+    km = _km.kmedoids(sub, num_uavs, rng=rng, n_init=5)
+    labels_full = _np.full(len(nodes), -1, dtype=int)
+    labels_full[wp_nodes] = km.labels
+    medoids_global = _np.array([int(wp_nodes[m]) for m in km.medoids])
+    st["cluster_s"] = time.time() - t0
+    print(f"k-medoids in {st['cluster_s']:.2f} s, cluster sizes "
+          f"{_np.bincount(km.labels, minlength=num_uavs).tolist()}")
+
+    # ---- balance ---------------------------------------------------------
+    t0 = time.time()
+    # One config for BOTH objectives. `closed_tours` in particular must match:
+    # it decides whether a tour's cost includes the return leg to the start, so
+    # a minsum arm evaluated open against a minmax arm evaluated closed would
+    # differ by a whole edge per UAV and the 2x2 ablation would be measuring
+    # that instead of the objective.
+    cfg = _balance.BalanceConfig(max_seconds=float(args.balance_max_seconds))
+    if args.objective == "minmax":
+        res = _balance.balance_makespan(cost, tm, labels_full, start_nodes,
+                                        medoids=medoids_global, cfg=cfg, rng=rng)
+        labels_full = res.labels
+        uav_of_cluster = res.uav_of_cluster
+        print(f"balance: makespan {res.makespan0:.1f} -> {res.makespan:.1f} s "
+              f"({res.improvement:+.1%}), {res.n_moves} move(s), {res.terminated}")
+    else:
+        # minsum still chooses a cluster->UAV pairing -- otherwise the arms
+        # would differ by whether the pairing was optimised at all rather than
+        # by the objective -- but it optimises the SUM, matching its own
+        # objective. Pairing on the max here would make this arm partly min-max
+        # and would understate A2-over-A1 and A4-over-A3.
+        ev = _balance._Evaluator(cost, tm, start_nodes, num_uavs,
+                                 cfg.closed_tours)
+        uav_of_cluster, _times = _balance.best_pairing(ev, labels_full,
+                                                       objective="minsum")
+    st["balance_s"] = time.time() - t0
+
+    # ---- relabel into UAV space -----------------------------------------
+    # EVERYTHING DOWNSTREAM IS INDEXED BY UAV, NOT BY CLUSTER. The legacy path
+    # sets that convention at line 549: `vstack([start_shifted[i], cluster_i])`,
+    # so `deckga_paths[i]` is UAV i's tour starting from start point i, and the
+    # executor hands `paths[i]` to drone i.
+    #
+    # k-medoids labels are arbitrary cluster ids, and `best_pairing` /
+    # `balance_makespan` then choose which UAV flies which cluster -- that
+    # permutation is the entire point of the min-max arms. Emitting the lists in
+    # cluster order would hand drone j a tour whose first waypoint is drone
+    # `uav_of_cluster[j]`'s start point: every aircraft would open the mission by
+    # transiting to someone else's start, and the pairing optimisation would be
+    # silently discarded.
+    #
+    # (It would NOT corrupt the offline makespan aggregate, since max over tours
+    # is order-invariant, which is exactly why this could have reached Gazebo
+    # unnoticed.)
+    #
+    # Remapping the labels once, here, is safer than carrying the permutation
+    # through three list-building sites: afterwards `labels == i` means "the
+    # waypoints UAV i flies" and the index is the UAV everywhere below.
+    uav_of_cluster = _np.asarray(uav_of_cluster, dtype=int)
+    if sorted(uav_of_cluster.tolist()) != list(range(num_uavs)):
+        raise AssertionError(
+            f"uav_of_cluster must be a permutation of 0..{num_uavs - 1}, "
+            f"got {uav_of_cluster.tolist()}"
+        )
+    labels_uav = _np.full_like(labels_full, -1)
+    for j in range(num_uavs):
+        labels_uav[labels_full == j] = int(uav_of_cluster[j])
+    labels_full = labels_uav
+
+    # ---- tours -----------------------------------------------------------
+    t0 = time.time()
+    ga_iters = int(args.ga_iters) if args.ga_iters else int(1e5)
+    deckga_paths, dega_lengths, raw_lengths = [], [], []
+    for u in range(num_uavs):
+        members = _np.flatnonzero(labels_full == u).tolist()
+        start = int(start_nodes[u])
+        # Per-UAV seed so the tours are independent but reproducible.
+        rng_j = _np.random.default_rng(
+            (args.planner_seed if args.planner_seed is not None else 0) + 1000 + u)
+        gres = _tour.ga_tour(cost, members, start, num_iter=ga_iters,
+                             rng=rng_j, points_xyz=nodes)
+        # ga_tour puts `start` at local index 0 and relies on the GA rotating
+        # its route to begin at row 0. If that ever stops holding, the tour
+        # still contains the right nodes in a valid order, so nothing raises --
+        # the aircraft simply launches toward some waypoint in the middle of its
+        # route and returns to its start last. Cheap to check, invisible if not.
+        # `route_indices` is ALREADY CLOSED: GA_path_planning.py:252 returns
+        # `concatenate([idx, idx[:1]])`, so the start node appears again as the
+        # final entry and the array is len(members) + 2 long. Checking raw
+        # uniqueness here would therefore always fail.
+        route = _np.asarray(gres.route_indices, dtype=int)
+        if int(route[0]) != start:
+            raise AssertionError(
+                f"UAV {u}: tour begins at node {int(route[0])}, not its start "
+                f"node {start}; GA rotation assumption in ga_tour broken"
+            )
+        if int(route[-1]) != start:
+            raise AssertionError(
+                f"UAV {u}: tour ends at node {int(route[-1])}, not back at its "
+                f"start node {start}; the route is not a closed tour"
+            )
+        body = route[:-1]
+        if len(set(body.tolist())) != len(body):
+            raise AssertionError(
+                f"UAV {u}: tour revisits a node ({len(body)} stops, "
+                f"{len(set(body.tolist()))} unique)"
+            )
+        if len(body) != len(members) + 1:
+            raise AssertionError(
+                f"UAV {u}: tour visits {len(body)} node(s) but the cluster has "
+                f"{len(members)} waypoint(s) plus 1 start"
+            )
+        path = ensure_closed_tour(nodes[route])
+        deckga_paths.append(path)
+        dega_lengths.append(calculate_path_distance(path))
+        raw_lengths.append(calculate_path_distance(nodes[[start] + members]))
+        print(f"  UAV {u} tour: {len(members)} wp, length={dega_lengths[-1]:.3f}")
+    st["ga_s"] = time.time() - t0
+    print(f"tours in {st['ga_s']:.1f} s")
+
+    centroids = _np.array([
+        nodes[_np.flatnonzero(labels_full == u)].mean(axis=0)
+        if (labels_full == u).any() else _np.zeros(3)
+        for u in range(num_uavs)
+    ])
+
+    return (deckga_paths, dega_lengths, raw_lengths, centroids,
+            labels_full, uav_of_cluster, len(unreachable),
+            dict(cost.meta), st)
+
+
+# ----------------------------
 # Main
 # ----------------------------
 
@@ -173,6 +415,41 @@ def main():
     ap.add_argument("--num_uavs", type=int, default=3)
     ap.add_argument("--start_points", default="10,0,10;50,20,10;90,0,10",
                     help='Semicolon-separated: "x,y,z;x,y,z;..." (must match num_uavs)')
+    # --- campaign arms ------------------------------------------------------
+    # Omit every one of these and the planner takes an explicit legacy branch
+    # that is byte-for-byte what it has always done. See _is_legacy below --
+    # the guarantee is a single auditable `if`, not "the general path with
+    # default parameters", because merely BUILDING a cost matrix consumes
+    # global-RNG draws and would shift everything downstream of DCKmeans'
+    # np.random.seed(42).
+    ap.add_argument("--cluster", default="kmeans", choices=["kmeans", "kmedoids"],
+                    help="Allocation. kmeans is DCKmeans, the published method. "
+                         "kmedoids works on any cost matrix (k-means needs a "
+                         "Euclidean mean, which a detour metric has no notion of) "
+                         "and cannot produce an empty cluster.")
+    ap.add_argument("--cost", default="euclidean", choices=["euclidean", "quicknav"],
+                    help="Edge metric for BOTH clustering and tour ordering. "
+                         "quicknav prices each edge by the length of the avoided "
+                         "route rather than the straight line.")
+    ap.add_argument("--objective", default="minsum", choices=["minsum", "minmax"],
+                    help="minsum is total fleet distance, the published objective. "
+                         "minmax is makespan -- the longest tour -- which is what "
+                         "actually determines when a concurrent mission ends.")
+    ap.add_argument("--planner_seed", type=int, default=None,
+                    help="Explicit RNG seed for clustering and the GA. Without it "
+                         "the planner is reproducible only by accident, via the "
+                         "np.random.seed(42) inside DCKmeans.")
+    ap.add_argument("--arm", default=None, help="Label recorded in the pickle.")
+    ap.add_argument("--time_model", default=None, metavar="V_EFF,T_STOP",
+                    help="Execution time model. Default comes from planner.timing.")
+    ap.add_argument("--cost_cache_dir", default=None,
+                    help="Reuse a prebuilt cost matrix. The matrix depends only on "
+                         "the scene, so one build serves every arm and seed of it.")
+    ap.add_argument("--ga_iters", type=int, default=None, help="Default 100000.")
+    ap.add_argument("--ga_defect", default="fixed", choices=["fixed", "broken"],
+                    help="'broken' reproduces the original flip-mutation defect, so "
+                         "the before/after comparison stays runnable.")
+    ap.add_argument("--balance_max_seconds", type=float, default=20.0)
     ap.add_argument("--no_plot", action="store_true", help="Disable matplotlib plots")
     ap.add_argument("--save_fig_dir", default=None,
                     help="If set, save figures (PNG) into this directory")
@@ -240,6 +517,36 @@ def main():
     print(f"Start pts      : {start_points}")
 
     # -------------------------------------------------------
+    # Which arm is this?
+    #
+    # The legacy predicate is deliberately explicit and deliberately total: if
+    # ANY campaign flag is non-default we take the new path, and otherwise we
+    # run the original code verbatim. Nothing is "the same code with different
+    # parameters" -- that phrasing is how a byte-identity guarantee quietly
+    # stops being true.
+    # -------------------------------------------------------
+    _is_legacy = (
+        args.cluster == "kmeans"
+        and args.cost == "euclidean"
+        and args.objective == "minsum"
+        and args.planner_seed is None
+        and args.ga_iters is None
+        and args.ga_defect == "fixed"
+        and args.cost_cache_dir is None
+    )
+    arm_label = args.arm or ("A0_published" if _is_legacy else
+                             f"{args.cluster}_{args.cost}_{args.objective}")
+    stage_times = {}
+    cost_meta = {}
+    time_model_used = None
+    labels_out = None
+    uav_of_cluster_out = None
+    n_unreachable = 0
+    print(f"Arm            : {arm_label}"
+          f"  (cluster={args.cluster} cost={args.cost} obj={args.objective}"
+          f" seed={args.planner_seed} legacy={_is_legacy})")
+
+    # -------------------------------------------------------
     # Validate: no waypoint or start point falls inside an obstacle cube
     # -------------------------------------------------------
     all_check_pts = np.vstack([points, start_points])
@@ -268,12 +575,41 @@ def main():
     points_shifted = all_shifted[num_uavs:]
 
     # -------------------------------------------------------
-    # Step 3: DCKmeans
+    # Step 3: allocation
+    #
+    # The non-legacy arms run an entirely separate, INDEX-CARRYING path and
+    # return early from this block, because the published path loses indices at
+    # the first step: manual_kmeans_clustering returns coordinates, not labels
+    # (DCKmeans.py:69). Recovering them afterwards would mean matching floats,
+    # which is exactly the bug the new path exists to avoid.
+    #
+    # The new path also skips shift_to_positive entirely and works in ORIGINAL
+    # coordinates. The shift exists for k-means numerical stability; k-medoids
+    # on a precomputed matrix does not need it, and keeping one frame removes
+    # the trap where the cost matrix is built where the obstacles are NOT.
     # -------------------------------------------------------
-    t0 = time.time()
-    clusters, centroids = manual_kmeans_clustering(points_shifted, num_uavs)
-    print(f"\nDCKmeans done in {time.time() - t0:.3f} s")
-    print("Centroids:\n", centroids)
+    if not _is_legacy:
+        deckga_paths, dega_lengths, raw_lengths, centroids, labels_out, \
+            uav_of_cluster_out, n_unreachable, cost_meta, _st = _run_arm(
+                args=args,
+                points=points,
+                start_points=start_points,
+                obstacle_xyz=obstacle_xyz,
+                obs_size=obs_size,
+                num_uavs=num_uavs,
+                arm_label=arm_label,
+            )
+        stage_times.update(_st)
+        offset_used = np.zeros(3, dtype=float)   # no shift on this path
+        from planner import timing as _t
+        time_model_used = (_t.TimeModel.parse(args.time_model) if args.time_model
+                           else _t.GAZEBO_SPEED1)
+    else:
+        t0 = time.time()
+        clusters, centroids = manual_kmeans_clustering(points_shifted, num_uavs)
+        print(f"\nDCKmeans done in {time.time() - t0:.3f} s")
+        print("Centroids:\n", centroids)
+        stage_times["cluster_s"] = time.time() - t0
 
     if (not args.no_plot) and args.plot_kmeans:
         fig_km = plt.figure()
@@ -289,36 +625,41 @@ def main():
         maybe_save_fig(fig_km, save_dir, "kmeans_clustering")
         plt.show()
 
-    # -------------------------------------------------------
-    # Step 4: Add start points + GA optimisation per UAV
-    # -------------------------------------------------------
-    clusters_with_start = []
-    for i, cluster in enumerate(clusters):
-        cluster_arr = np.asarray(cluster, dtype=float)
-        clusters_with_start.append(np.vstack([start_shifted[i], cluster_arr]))
+    # Legacy only. The arm path already produced deckga_paths above, in
+    # original coordinates, with its indices carried through, so none of
+    # the shifted-space machinery below applies to it.
+    if _is_legacy:
+        # -------------------------------------------------------
+        # Step 4: Add start points + GA optimisation per UAV
+        # -------------------------------------------------------
+        clusters_with_start = []
+        for i, cluster in enumerate(clusters):
+            cluster_arr = np.asarray(cluster, dtype=float)
+            clusters_with_start.append(np.vstack([start_shifted[i], cluster_arr]))
 
-    raw_lengths = [calculate_path_distance(c) for c in clusters_with_start]
-    print("\n--- Raw path lengths (before GA, shifted) ---")
-    for i, d in enumerate(raw_lengths):
-        print(f"  UAV {i}: {d:.3f}")
+        raw_lengths = [calculate_path_distance(c) for c in clusters_with_start]
+        print("\n--- Raw path lengths (before GA, shifted) ---")
+        for i, d in enumerate(raw_lengths):
+            print(f"  UAV {i}: {d:.3f}")
 
-    optimized_paths_shifted = []
-    dega_lengths = []
-    t0 = time.time()
+        optimized_paths_shifted = []
+        dega_lengths = []
+        t0 = time.time()
 
-    for i, cluster_points in enumerate(clusters_with_start):
-        opt = ga_3d_pathplanning(cluster_points)
-        opt = ensure_closed_tour(opt)
-        optimized_paths_shifted.append(opt)
-        dega_lengths.append(calculate_path_distance(opt))
-        print(f"  UAV {i} GA done, length={dega_lengths[-1]:.3f}")
+        for i, cluster_points in enumerate(clusters_with_start):
+            opt = ga_3d_pathplanning(cluster_points)
+            opt = ensure_closed_tour(opt)
+            optimized_paths_shifted.append(opt)
+            dega_lengths.append(calculate_path_distance(opt))
+            print(f"  UAV {i} GA done, length={dega_lengths[-1]:.3f}")
 
-    print(f"GA done in {time.time() - t0:.3f} s")
+        print(f"GA done in {time.time() - t0:.3f} s")
+        stage_times["ga_s"] = time.time() - t0
 
-    # -------------------------------------------------------
-    # Step 5: Shift deckga_paths back to original coords
-    # -------------------------------------------------------
-    deckga_paths = [np.asarray(p, dtype=float) - offset_used for p in optimized_paths_shifted]
+        # -------------------------------------------------------
+        # Step 5: Shift deckga_paths back to original coords
+        # -------------------------------------------------------
+        deckga_paths = [np.asarray(p, dtype=float) - offset_used for p in optimized_paths_shifted]
 
     # -------------------------------------------------------
     # Step 6: QuickNav obstacle avoidance (original coords)
@@ -367,6 +708,40 @@ def main():
         "obs_size": obs_size,
         "detected_indices": all_detected_indices,
         "final_lengths": final_lengths,
+        # --- campaign additions, strictly additive ---------------------------
+        # Nothing downstream reads these yet except the new metrics;
+        # compute_all_metrics requires only 6 keys and _measure_quicknav_only 3,
+        # so every existing consumer is unaffected.
+        "arm": arm_label,
+        "cluster_method": args.cluster,
+        "cost_kind": args.cost,
+        "objective": args.objective,
+        "planner_seed": args.planner_seed,
+        "ga_defect": args.ga_defect,
+        "ga_iters": int(args.ga_iters) if args.ga_iters else int(1e5),
+        "is_legacy": bool(_is_legacy),
+        # The allocation itself, which DCKmeans never returned. Without it
+        # nothing downstream can say WHICH waypoints a UAV was given, only
+        # where it flew.
+        #
+        # `labels` is in UAV SPACE: `labels == i` are the waypoints flown by
+        # UAV i, matching `deckga_paths[i]` and `start_points[i]`. The
+        # cluster->UAV permutation has ALREADY been applied (see _run_arm), so
+        # do not index through `uav_of_cluster` again -- that is kept only as
+        # provenance, recording which k-medoids cluster id became which UAV.
+        # -1 marks a node that is not an assigned waypoint (a start point, or a
+        # waypoint dropped as unreachable).
+        "labels": labels_out,
+        "uav_of_cluster": uav_of_cluster_out,
+        # Not previously saved at all, so nothing could verify which start went
+        # with which path.
+        "start_points": start_points,
+        "time_model": (time_model_used.as_dict() if time_model_used else None),
+        "cost_matrix_meta": cost_meta,
+        "n_unreachable_waypoints": int(n_unreachable),
+        # Real per-stage timings, so the harness stops inferring DECK-GA time by
+        # subtracting a re-measured QuickNav time and a 0.3 s guess.
+        "stage_times_s": stage_times,
     }
 
     with out_path.open("wb") as f:

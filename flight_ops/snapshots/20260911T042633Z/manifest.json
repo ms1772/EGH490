@@ -1,0 +1,47 @@
+{
+  "label": "droneA-flown-config",
+  "captured_utc": "20260911T042633Z",
+  "expected_state": "C:\\Users\\mitch\\Multi-UAV Project\\ROS2_MultiUAV_3D-main\\flight_ops\\lab_config\\expected_state.yaml",
+  "baseline": null,
+  "local_only": true,
+  "sources": [
+    {
+      "name": "git",
+      "ok": true,
+      "artifact": "git.txt",
+      "error": null,
+      "sha256": "3b6c918e20da5d5d19c527d9be0f32e8fbbd474e50ce5eb2a40c1b8e94f40c21",
+      "parsed": {
+        "head": "66c3477dc3f5efb8b5f119afc7b8be455d7daa9c",
+        "branch": "docs/runsheets",
+        "dirty": true
+      }
+    },
+    {
+      "name": "env",
+      "ok": true,
+      "artifact": "env.txt",
+      "error": null,
+      "sha256": "7f669b08229ea0a11df185ede0bb530041c5f733c495e833d2b1b157cbdd7da5",
+      "parsed": {}
+    },
+    {
+      "name": "apt",
+      "ok": false,
+      "artifact": null,
+      "error": "dpkg unavailable or no ros-humble packages",
+      "sha256": null,
+      "parsed": {}
+    },
+    {
+      "name": "px4:droneA",
+      "ok": false,
+      "artifact": null,
+      "error": "no such file: \\c\\Users\\mitch\\OneDrive - Queensland University of Technology\\Documents\\QGroundControl\\Parameters\\file.params",
+      "sha256": null,
+      "parsed": {}
+    }
+  ],
+  "gates": [],
+  "rollback": {}
+}

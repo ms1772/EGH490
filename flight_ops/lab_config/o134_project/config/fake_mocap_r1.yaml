@@ -53,8 +53,14 @@
     # SYNTHETIC MOTION 0.5 m off the net; the geofence lives further in
     # still, so a nominal run never trips the guard's `geofence` condition
     # and a trip during a sim run is real information.
+    #
+    # box_center_m tracks config/volume_guard.yaml, which moved to [0, 0, 2]
+    # on 2026-09-17 once the mocap origin was measured to be on the floor. If
+    # these two ever disagree the rig stops being a rehearsal: the synthetic
+    # body would orbit the centre of one box while the guard fences another,
+    # and every sim run would open with a geofence trip that means nothing.
     box_size_m: [8.0, 6.0, 4.0]
-    box_center_m: [0.0, 0.0, 0.0]
+    box_center_m: [0.0, 0.0, 2.0]
     box_margin_m: 0.5
 
     # -- trajectory -------------------------------------------------------

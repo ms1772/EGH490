@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
 from typing import List, Optional
@@ -16,7 +17,15 @@ WAYPOINT_BOUNDS_Z = (0.0, 50.0)
 
 OBSTACLE_BOUNDS_X = (-90.0, 90.0)
 OBSTACLE_BOUNDS_Y = (-90.0, 90.0)
-OBSTACLE_BOUNDS_Z = (5.0, 25.0)
+# Matched to WAYPOINT_BOUNDS_Z. Previously (5.0, 25.0), which left the top
+# half and the floor of the flight volume obstacle-free, so waypoints there
+# never needed avoidance. Measured as near-neutral for the mean penalty --
+# density is the stronger lever -- but it is the physically sensible setup
+# and it makes the dense arms meaningful instead of vertically segregated.
+# Rejection sampling (sweep_offline._generate_obstacles) is what makes this
+# safe: widening z raises the waypoint-in-obstacle rate from 2 to 6 per
+# 100/100 scene, every one of which would abort the scene for every arm.
+OBSTACLE_BOUNDS_Z = (0.0, 50.0)
 
 OBS_SIZE_DEFAULT = 5.0
 NUM_UAVS_DEFAULT = 3
@@ -38,9 +47,76 @@ class TrialSpec:
     obstacles_fixture: Optional[Path] = None
     points_fixture: Optional[Path] = None
 
+    # --- campaign arm -------------------------------------------------------
+    # Defaults reproduce the published planner exactly, so every existing
+    # matrix keeps behaving as it did and every existing trial_id is unchanged.
+    arm: Optional[str] = None
+    cluster: str = "kmeans"
+    cost_kind: str = "euclidean"
+    objective: str = "minsum"
+    planner_seed: Optional[int] = None
 
-def _make_id(prefix: str, n_points: int, n_obstacles: int, seed: int) -> str:
-    return f"{prefix}_n{n_points}_o{n_obstacles}_s{seed}"
+    @property
+    def scene_id(self) -> str:
+        """Identifies the SCENE, independent of which arm plans it.
+
+        The cross-arm comparison is paired on (scene_id, planner_seed): the arms
+        must differ and the scene must not. Deliberately excludes arm, cluster,
+        cost and objective.
+
+        num_uavs IS included, because it changes the problem rather than the
+        method: the same waypoints split three ways is not the same scene as
+        split one way. Without it the fleet matrix produces three rows per
+        (scene, arm, planner_seed) -- one per fleet size -- and
+        `paired_vs_reference` keeps only the last, silently comparing a 1-UAV
+        run against a 3-UAV one. Measured on campaign_fleet: 80 colliding keys.
+
+        Appended only when non-default, exactly as `_make_id` does, so every
+        scene_id produced before the fleet matrix existed is byte-identical and
+        the two committed run dirs still pair correctly.
+        """
+        base = f"n{self.n_points}_o{self.n_obstacles}_z{self.obs_size:g}_s{self.seed}"
+        if self.num_uavs != NUM_UAVS_DEFAULT:
+            base += f"_u{self.num_uavs}"
+        return base
+
+
+def _make_id(
+    prefix: str,
+    n_points: int,
+    n_obstacles: int,
+    seed: int,
+    *,
+    num_uavs: int = NUM_UAVS_DEFAULT,
+    obs_size: float = OBS_SIZE_DEFAULT,
+    arm: Optional[str] = None,
+    planner_seed: Optional[int] = None,
+) -> str:
+    """Build a trial_id that is injective over every dimension a matrix varies.
+
+    Only NON-DEFAULT components are appended, so every id this function produced
+    before -- `report_n30_o5_s3` and friends -- is byte-for-byte unchanged and
+    resume into the two committed run directories still works.
+
+    This matters more than it looks. trial_id is load-bearing in four places:
+    the resume key (sweep_offline._existing_ok_trial_ids), the per-trial output
+    DIRECTORY name, the join key between offline_master.csv and
+    gazebo_master.csv, and the executor summary glob in sweep_gazebo. Two trials
+    sharing an id do not collide loudly -- the second is skipped as "already
+    done" and the report quotes the FIRST trial's numbers for both. That is a
+    wrong-answer failure with no error message, which is why resolve_matrix
+    asserts uniqueness below.
+    """
+    out = f"{prefix}_n{n_points}_o{n_obstacles}_s{seed}"
+    if num_uavs != NUM_UAVS_DEFAULT:
+        out += f"_u{num_uavs}"
+    if abs(float(obs_size) - float(OBS_SIZE_DEFAULT)) > 1e-12:
+        out += f"_z{obs_size:g}"
+    if arm is not None:
+        out += f"_{arm}"
+    if planner_seed is not None:
+        out += f"_p{planner_seed}"
+    return out
 
 
 def matrix_smoke() -> List[TrialSpec]:
@@ -106,15 +182,224 @@ def matrix_gazebo_smoke() -> List[TrialSpec]:
     )]
 
 
+# ---------------------------------------------------------------------------
+# Campaign arms
+#
+# Five planner configurations. A0 is the published method and the regression
+# anchor; A1-A4 are a clean 2x2 over metric and objective, with A1 isolating the
+# k-means -> k-medoids substitution so it cannot be mistaken for the
+# contribution.
+#
+#   arm  cluster    cost       objective   isolates
+#   A0   kmeans     euclidean  minsum      DECK-GA as published
+#   A1   kmedoids   euclidean  minsum      the clusterer swap alone
+#   A2   kmedoids   euclidean  minmax      balancing alone
+#   A3   kmedoids   quicknav   minsum      the obstacle-aware metric alone
+#   A4   kmedoids   quicknav   minmax      both together
+# ---------------------------------------------------------------------------
+ARMS = [
+    ("A0_published",   "kmeans",   "euclidean", "minsum"),
+    ("A1_eu_minsum",   "kmedoids", "euclidean", "minsum"),
+    ("A2_eu_minmax",   "kmedoids", "euclidean", "minmax"),
+    ("A3_qn_minsum",   "kmedoids", "quicknav",  "minsum"),
+    ("A4_qn_minmax",   "kmedoids", "quicknav",  "minmax"),
+]
+
+# Density sweep. {0,5,10,20} are the original levels, kept so the new results
+# sit alongside the old conditions; {50,100} are where avoidance actually bites.
+# Measured at n=100: M=20 gives 17% detour edges, M=100 gives 46.8%.
+# M=200 was dropped -- ~25 min per scene to build the cost matrix, 15%+
+# infeasible edges and ~5 unreachable waypoints, i.e. a degenerate scene rather
+# than a harder one.
+DENSITY_LEVELS = [0, 5, 10, 20, 50, 100]
+
+# A0 is bit-deterministic per scene: DCKmeans seeds the GLOBAL numpy stream with
+# 42 and the GA draws from it. Three "seeds" would be three identical rows, a
+# zero-width confidence interval and inflated paired-t power. One is correct.
+PLANNER_SEEDS_STOCHASTIC = [0, 1, 2]
+PLANNER_SEEDS_DETERMINISTIC = [None]
+
+
+def _arm_seeds(cluster: str):
+    return (PLANNER_SEEDS_DETERMINISTIC if cluster == "kmeans"
+            else PLANNER_SEEDS_STOCHASTIC)
+
+
+def matrix_campaign_method(scene_seeds=None, waypoint_counts=None,
+                           densities=None) -> List[TrialSpec]:
+    """The headline offline comparison: every arm on every scene."""
+    scene_seeds = list(range(5)) if scene_seeds is None else list(scene_seeds)
+    waypoint_counts = waypoint_counts or [30, 100]
+    densities = densities or DENSITY_LEVELS
+
+    trials: List[TrialSpec] = []
+    for arm, cluster, cost_kind, objective in ARMS:
+        for pseed in _arm_seeds(cluster):
+            for n, m, s in product(waypoint_counts, densities, scene_seeds):
+                trials.append(TrialSpec(
+                    trial_id=_make_id("cmp", n, m, s, arm=arm, planner_seed=pseed),
+                    n_points=n, n_obstacles=m, seed=s,
+                    arm=arm, cluster=cluster, cost_kind=cost_kind,
+                    objective=objective, planner_seed=pseed,
+                ))
+    return trials
+
+
+def matrix_campaign_pilot() -> List[TrialSpec]:
+    """Smallest matrix that exercises all five arms. The gate before anything long."""
+    return matrix_campaign_method(scene_seeds=[0], waypoint_counts=[30],
+                                  densities=[0, 20, 100])
+
+
+# Start points per fleet size. Deliberately NOT a prefix of the three-UAV
+# default: taking the first N would start the single-UAV case at (10,0,10), a
+# corner of the volume, and the fleet-size comparison would partly be measuring
+# where the aircraft happened to begin. These stay spread across the same span
+# at every size. `parse_start_points` requires exactly num_uavs entries and
+# does not truncate, so each size needs its own string.
+FLEET_START_POINTS = {
+    1: "50,20,10",
+    2: "10,0,10;90,0,10",
+    3: START_POINTS_DEFAULT,
+}
+
+# Depots for k>=4, appended to the published three-UAV set in this fixed order,
+# so growing the fleet NEVER moves an aircraft that is already placed. k=4 is
+# k=3 plus one depot, k=5 is k=4 plus one, and so on.
+#
+# A three-column lattice at x in {10,50,90}, extended one row at a time and
+# centre-first within a row. Every point lies inside OBSTACLE_BOUNDS_{X,Y}, and
+# obstacle rejection sampling excludes depots (see sweep_offline.
+# _write_exclusion_pkl), so none can be swallowed by a cube.
+#
+# BE HONEST ABOUT THE JOIN: k<=3 above follows a DIFFERENT rule -- one UAV at
+# the centre, two at the corners, neither of which is a prefix of the other --
+# so the nesting guarantee holds only from three UAVs upward. A small geometry
+# artefact at the 3->4 step cannot be ruled out, and the report says so.
+_FLEET_EXTRA_DEPOTS = [
+    (50.0, -20.0), (10.0, -20.0), (90.0, -20.0),   # k = 4, 5, 6
+    (50.0,  40.0), (10.0,  40.0), (90.0,  40.0),   # k = 7, 8, 9
+    (50.0, -40.0), (10.0, -40.0), (90.0, -40.0),   # k = 10, 11, 12
+]
+for _k in range(4, 4 + len(_FLEET_EXTRA_DEPOTS)):
+    FLEET_START_POINTS[_k] = ";".join(
+        [START_POINTS_DEFAULT]
+        + [f"{x:g},{y:g},10" for x, y in _FLEET_EXTRA_DEPOTS[:_k - 3]])
+del _k
+
+
+def matrix_campaign_fleet(scene_seeds=None, fleet_sizes=None) -> List[TrialSpec]:
+    """Fleet-size scaling, for the published arm and the full reformulation.
+
+    Only A0 and A4. The 2x2 ablation already separates clustering from
+    objective; this axis asks a different question -- does the makespan
+    advantage grow, shrink or hold as the fleet grows? -- and running all five
+    arms across three fleet sizes would multiply the cost to answer it no
+    better. Densities are the two that actually exercise avoidance.
+
+    Offline only: no simulator, so this can be run at any time, which is why it
+    is safe to leave until after the Gazebo stage.
+    """
+    scene_seeds = list(range(5)) if scene_seeds is None else list(scene_seeds)
+    fleet_sizes = list(fleet_sizes) if fleet_sizes else [1, 2, 3]
+    arms = [a for a in ARMS if a[0] in ("A0_published", "A4_qn_minmax")]
+
+    trials: List[TrialSpec] = []
+    for arm, cluster, cost_kind, objective in arms:
+        for pseed in _arm_seeds(cluster):
+            for n, m, s, u in product([30, 100], [20, 100], scene_seeds,
+                                      fleet_sizes):
+                trials.append(TrialSpec(
+                    trial_id=_make_id("flt", n, m, s, num_uavs=u, arm=arm,
+                                      planner_seed=pseed),
+                    n_points=n, n_obstacles=m, seed=s, num_uavs=u,
+                    start_points=FLEET_START_POINTS[u],
+                    arm=arm, cluster=cluster, cost_kind=cost_kind,
+                    objective=objective, planner_seed=pseed,
+                ))
+    return trials
+
+
+def matrix_campaign_gazebo(scene_seeds=None) -> List[TrialSpec]:
+    """Every arm across the ORIGINAL 8 conditions, replacing the old matrix.
+
+    Keeps obs in {0,5,10,20} and n in {30,100} so these supersede the previous
+    run condition-for-condition. Those 5 usable rows were flown with the broken
+    GA and are not a valid baseline for anything.
+    """
+    scene_seeds = [0, 1] if scene_seeds is None else list(scene_seeds)
+    trials: List[TrialSpec] = []
+    for arm, cluster, cost_kind, objective in ARMS:
+        pseed = _arm_seeds(cluster)[0]
+        for n, m, s in product([30, 100], [0, 5, 10, 20], scene_seeds):
+            trials.append(TrialSpec(
+                trial_id=_make_id("gzc", n, m, s, arm=arm, planner_seed=pseed),
+                n_points=n, n_obstacles=m, seed=s,
+                arm=arm, cluster=cluster, cost_kind=cost_kind,
+                objective=objective, planner_seed=pseed,
+            ))
+    # n=30 first: if the night goes wrong the cheap half is already banked.
+    trials.sort(key=lambda t: (t.n_points, t.n_obstacles, t.seed, t.trial_id))
+    return trials
+
+
 MATRICES = {
     "smoke": matrix_smoke,
     "report": matrix_report,
     "gazebo_subset": matrix_gazebo_subset,
     "gazebo_smoke": matrix_gazebo_smoke,
+    "campaign_pilot": matrix_campaign_pilot,
+    "campaign_method": matrix_campaign_method,
+    "campaign_fleet": matrix_campaign_fleet,
+    "campaign_gazebo": matrix_campaign_gazebo,
+
+    # Larger fleets, run after the published 1/2/3 sweep. Separate entries
+    # rather than extra parameters on `campaign_fleet`, because
+    # `sweep_offline` calls `resolve_matrix(name)` with NO kwargs -- a fleet
+    # size that cannot reach the CLI cannot be run.
+    #
+    # `_large` stops at 100 waypoints on purpose: thirty waypoints split twelve
+    # ways is under three per aircraft, where there is no tour left to order
+    # and makespan degenerates into the start->waypoint transit. That would
+    # measure depot placement, not planning.
+    "campaign_fleet_mid": lambda: matrix_campaign_fleet(fleet_sizes=[4, 5, 6]),
+    "campaign_fleet_large": lambda: [
+        t for t in matrix_campaign_fleet(fleet_sizes=[8, 10, 12])
+        if t.n_points == 100
+    ],
 }
 
 
-def resolve_matrix(name: str) -> List[TrialSpec]:
+def resolve_matrix(name: str, **kwargs) -> List[TrialSpec]:
+    """Build a matrix by name, asserting its trial_ids are unique.
+
+    The assertion is the point. A duplicate trial_id is skipped by the resume
+    logic as "already done" and the report then quotes one trial's numbers for
+    both -- silently, with no error anywhere. Crashing at matrix-build time
+    turns a wrong-answer failure into a startup failure.
+    """
     if name not in MATRICES:
         raise ValueError(f"Unknown matrix '{name}'. Choices: {sorted(MATRICES)}")
-    return MATRICES[name]()
+    trials = MATRICES[name](**kwargs) if kwargs else MATRICES[name]()
+
+    counts = Counter(t.trial_id for t in trials)
+    dupes = sorted(tid for tid, c in counts.items() if c > 1)
+    if dupes:
+        raise ValueError(
+            f"matrix {name!r} produced {len(dupes)} duplicate trial_id(s): "
+            f"{dupes[:5]}{' ...' if len(dupes) > 5 else ''}. "
+            f"Every dimension the matrix varies must reach _make_id, or trials "
+            f"overwrite each other's output directory and the resume logic "
+            f"silently reports the first trial's numbers for all of them."
+        )
+
+    for t in trials:
+        n_starts = len([s for s in t.start_points.split(";") if s.strip()])
+        if n_starts != t.num_uavs:
+            raise ValueError(
+                f"{t.trial_id}: start_points has {n_starts} entries but "
+                f"num_uavs={t.num_uavs}. DECK_GA_QuickNav.parse_start_points "
+                f"raises on this, but only after the subprocess has started -- "
+                f"catch it here instead."
+            )
+    return trials

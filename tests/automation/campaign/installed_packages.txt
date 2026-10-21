@@ -1,0 +1,33 @@
+# WSL package state BEFORE campaign prep
+# captured: 2026-10-11T17:01:07+10:00
+# distro:   Ubuntu 22.04.5 LTS
+# total ii packages: 2019
+
+## packages the campaign cares about, BEFORE:
+  ffmpeg = MISSING
+  imagemagick = MISSING
+  imagemagick-6.q16 = MISSING
+  xvfb = MISSING
+  scrot = MISSING
+  graphviz = INSTALLED (2.42.2-6ubuntu0.1)
+
+# ---------------------------------------------------------------
+# AFTER campaign prep -- 2026-10-11T17:02:04+10:00
+# total ii packages: 2044
+
+## packages the campaign cares about, AFTER:
+  ffmpeg = INSTALLED (7:4.4.2-0ubuntu0.22.04.1)
+  imagemagick = INSTALLED (8:6.9.11.60+dfsg-1.3ubuntu0.22.04.5)
+  imagemagick-6.q16 = INSTALLED (8:6.9.11.60+dfsg-1.3ubuntu0.22.04.5)
+  xvfb = MISSING
+  scrot = MISSING
+  graphviz = INSTALLED (2.42.2-6ubuntu0.1)
+
+## INSTALLED BY THIS CAMPAIGN (explicit, top level):
+     ffmpeg, imagemagick
+
+## TO REVERT:
+     wsl -u root -- apt-get remove -y ffmpeg imagemagick && \
+     wsl -u root -- apt-get autoremove -y
+
+## NOTE: graphviz was already present before this campaign -- do NOT remove it.

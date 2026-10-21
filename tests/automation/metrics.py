@@ -116,6 +116,46 @@ def residual_collisions_per_uav(
     return out
 
 
+def _time_model_from(pickle_data: dict):
+    """The time model the planner used, or the campaign default.
+
+    Single source of truth: planner.timing. Redefining v_eff/t_stop here would
+    let the planner optimise against one pair of constants while the report
+    scores against another, and every number would be quietly wrong.
+    """
+    from planner.timing import GAZEBO_SPEED1, TimeModel
+
+    tm = pickle_data.get("time_model")
+    if isinstance(tm, dict) and "v_eff" in tm:
+        return TimeModel(v_eff=float(tm["v_eff"]), t_stop=float(tm.get("t_stop", 0.0)))
+    return GAZEBO_SPEED1
+
+
+def _balance_ratio(values) -> float:
+    """max / mean. Scale-free, so it compares across problem sizes."""
+    v = [float(x) for x in values if x is not None]
+    if not v:
+        return 0.0
+    mean = sum(v) / len(v)
+    return (max(v) / mean) if mean > 0 else 1.0
+
+
+# Keys compute_all_metrics exports that are scalars, i.e. CSV-able. Used by
+# sweep_offline to assert its header covers them -- DictWriter(extrasaction=
+# "ignore") drops unknown keys SILENTLY, so a new metric that nobody adds to
+# the header simply never appears and nothing complains.
+CSV_EXPORTED_KEYS = [
+    "num_uavs",
+    "distance_baseline_total_m", "distance_avoided_total_m",
+    "detections_total", "avoidances_total", "residual_collisions_total",
+    "max_tour_baseline_m", "max_tour_avoided_m",
+    "makespan_baseline_s", "makespan_avoided_s",
+    "balance_ratio_baseline", "balance_ratio_avoided",
+    "wp_avoided_max",
+    "time_model_v_eff", "time_model_t_stop",
+]
+
+
 def compute_all_metrics(pickle_data: dict) -> Dict[str, object]:
     """Given a loaded DECK_GA_QuickNav output dict, compute every metric.
 
@@ -140,7 +180,23 @@ def compute_all_metrics(pickle_data: dict) -> Dict[str, object]:
     avoid_n = avoidances_per_uav(deckga_paths, quicknav_paths)
     residual_n = residual_collisions_per_uav(quicknav_paths, obstacle_xyz, obs_size)
 
-    return {
+    # --- makespan -----------------------------------------------------------
+    # The fleet metric. UAVs fly concurrently, so the mission ends when the
+    # SLOWEST one lands -- the max, never the sum. Total distance hides this
+    # completely: the committed run gz_n30_o0_s0 flew 329 / 322 / 526 m, a
+    # makespan 34% above the balanced mean, and the totals look unremarkable.
+    #
+    # The time model comes from the pickle when the planner recorded one, so
+    # the metric is scored with the SAME constants the planner optimised
+    # against. Falling back to two different numbers in two places is how a
+    # campaign ends up reporting something nobody optimised.
+    tm = _time_model_from(pickle_data)
+    wp_baseline = [max(0, len(np.asarray(p)) - 1) for p in deckga_paths]
+    wp_avoided = [max(0, len(np.asarray(p)) - 1) for p in quicknav_paths]
+    time_baseline = [tm.tour_time(d, n) for d, n in zip(dist_baseline, wp_baseline)]
+    time_avoided = [tm.tour_time(d, n) for d, n in zip(dist_avoided, wp_avoided)]
+
+    out = {
         "num_uavs": num_uavs,
         "distance_baseline_per_uav_m": dist_baseline,
         "distance_avoided_per_uav_m": dist_avoided,
@@ -152,7 +208,28 @@ def compute_all_metrics(pickle_data: dict) -> Dict[str, object]:
         "avoidances_total": int(sum(avoid_n)),
         "residual_collisions_per_uav": residual_n,
         "residual_collisions_total": int(sum(residual_n)),
+
+        # makespan in distance and in calibrated time
+        "max_tour_baseline_m": float(max(dist_baseline)) if dist_baseline else 0.0,
+        "max_tour_avoided_m": float(max(dist_avoided)) if dist_avoided else 0.0,
+        "makespan_baseline_s": float(max(time_baseline)) if time_baseline else 0.0,
+        "makespan_avoided_s": float(max(time_avoided)) if time_avoided else 0.0,
+        "tour_time_baseline_per_uav_s": time_baseline,
+        "tour_time_avoided_per_uav_s": time_avoided,
+
+        # how unevenly the work was shared; 1.0 is perfect
+        "balance_ratio_baseline": _balance_ratio(dist_baseline),
+        "balance_ratio_avoided": _balance_ratio(dist_avoided),
+
+        # waypoint counts drive the t_stop term and change under balancing
+        "wp_baseline_per_uav": wp_baseline,
+        "wp_avoided_per_uav": wp_avoided,
+        "wp_avoided_max": int(max(wp_avoided)) if wp_avoided else 0,
+
+        "time_model_v_eff": tm.v_eff,
+        "time_model_t_stop": tm.t_stop,
     }
+    return out
 
 
 def penetration_depth(segment_a: np.ndarray, segment_b: np.ndarray,

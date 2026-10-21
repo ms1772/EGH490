@@ -21,7 +21,7 @@ at the highest test the aircraft is cleared for and only drop back when
 something fails. A failure tells you where to bisect:
 
     F2 fails  ->  try F2a (square), then F2b (go-to), then F2c (takeoff/land)
-    F5 fails  ->  try two drones, then back to single
+    F5 fails  ->  try two drones, then F4b, then back to single
     F6 fails  ->  try F4 (one drone, one obstacle)
 
 Two exceptions that are never skipped, because they are about the airframe
@@ -201,6 +201,38 @@ Separately, and not blocking any of this: run a LiDAR scan of the same
 obstacle and compare the boxes it produces against the hand measurements.
 That closes the never-yet-run LiDAR-to-planner chain without any flight
 depending on it.
+
+## F4b  One drone, all three allocated paths, in sequence
+
+The rung between F4 and F5, and the one that carries the thesis if only one
+airframe is ever airworthy. F4 proves the drone avoids an obstacle. F5 proves
+three drones can share the air. F4b proves the *allocation* is flyable: the
+same aircraft flies path 0, then path 1, then path 2 of one three-UAV plan, one
+per battery.
+
+1. Build the plan once, and pass the geometry gate:
+   `flight_ops/lab_config/o134_mission/make_mission.sh`, then
+   `check_mission.py`. Nothing flies until it prints GEOMETRY GATE PASSED.
+2. Fly `--num_uavs 1 --path_index 0`, then `1`, then `2`, with
+   `--path_key quicknav_paths` and a `--run_tag` naming the index.
+   The three runs differ by exactly one argument, the way F2 and F3 do.
+3. Move the pad under each path's start point between flights. The transit
+   from the pad to the first waypoint is a straight `go_to` that no planner
+   has checked for obstacles.
+4. Insert the baseline run — `--path_key deckga_paths --path_index 0` — with
+   the obstacles physically REMOVED. That route is the un-avoided one and it
+   goes through them.
+
+**Pass criterion is coverage, not separation.** Every waypoint in the plan gets
+visited by someone, each route is flown as planned, and `collision_audit.py`
+finds no intersection on the avoided runs. Separation between aircraft is not
+tested here and cannot be — there is only one aircraft in the air.
+
+**This does not supersede F5.** F5 is the only test of concurrency: shared
+frame, simultaneous airspace, real separation. F4b is what you present if F5
+never becomes possible, and it is a weaker claim, stated as a weaker claim.
+`--path_index` exists for exactly this: without it `--num_uavs 1` silently
+truncates to path 0 and paths 1 and 2 are unreachable.
 
 ## F5  Three drones, no obstacles
 

@@ -109,7 +109,7 @@ def _make_plots(summary: List[dict], offline: List[dict], fig_dir: Path) -> Dict
         labels = [f"n={s['n_points']}, obs={s['n_obstacles']}" for s in summary]
         deckga = [_safe_float(s["planning_time_deckga_s_mean"]) for s in summary]
         qn = [_safe_float(s["planning_time_quicknav_s_mean"]) for s in summary]
-        fig, ax = plt.subplots(figsize=(max(8, len(labels) * 0.7), 4))
+        fig, ax = plt.subplots(figsize=(min(26, max(8, len(labels) * 0.7)), 4))
         x = range(len(labels))
         ax.bar(x, deckga, label="DECK-GA")
         ax.bar(x, qn, bottom=deckga, label="QuickNav")
@@ -130,7 +130,7 @@ def _make_plots(summary: List[dict], offline: List[dict], fig_dir: Path) -> Dict
         labels = [f"n={s['n_points']}, obs={s['n_obstacles']}" for s in summary]
         pen = [_safe_float(s["penalty_mean_m"]) for s in summary]
         pen_std = [_safe_float(s["penalty_std_m"]) for s in summary]
-        fig, ax = plt.subplots(figsize=(max(8, len(labels) * 0.7), 4))
+        fig, ax = plt.subplots(figsize=(min(26, max(8, len(labels) * 0.7)), 4))
         ax.bar(range(len(labels)), pen, yerr=pen_std, capsize=4)
         ax.set_xticks(range(len(labels)))
         ax.set_xticklabels(labels, rotation=45, ha="right")
@@ -148,7 +148,7 @@ def _make_plots(summary: List[dict], offline: List[dict], fig_dir: Path) -> Dict
     if summary:
         labels = [f"n={s['n_points']}, obs={s['n_obstacles']}" for s in summary]
         rc = [_safe_float(s["residual_collisions_total_mean"]) for s in summary]
-        fig, ax = plt.subplots(figsize=(max(8, len(labels) * 0.7), 3.5))
+        fig, ax = plt.subplots(figsize=(min(26, max(8, len(labels) * 0.7)), 3.5))
         ax.bar(range(len(labels)), rc, color="#cc4444")
         ax.set_xticks(range(len(labels)))
         ax.set_xticklabels(labels, rotation=45, ha="right")
@@ -161,7 +161,169 @@ def _make_plots(summary: List[dict], offline: List[dict], fig_dir: Path) -> Dict
         plt.close(fig)
         plots["collisions"] = p
 
+    hm = _plot_makespan_by_arm(summary, fig_dir)
+    if hm is not None:
+        plots["makespan_by_arm"] = hm
+
     return plots
+
+
+def _plot_makespan_by_arm(summary: List[dict], fig_dir: Path) -> Optional[Path]:
+    """THE headline figure: makespan per arm against obstacle density.
+
+    The campaign had no plot of its own main result -- the arm comparison
+    existed only as tables. The three legacy bar charts plot one bar per
+    condition, which was readable at 8 conditions and is not at 76: they came
+    out 6383 px wide, one bar per (n, density, fleet, arm).
+
+    This is a line per ARM instead, faceted by waypoint count, which is the
+    comparison the thesis actually makes and stays readable however many
+    conditions accumulate. Restricted to the 3-UAV rows so the fleet sweep's
+    1- and 2-UAV conditions cannot be silently averaged in beside them.
+    """
+    rows = [r for r in summary
+            if r.get("arm") and str(r.get("num_uavs", "3")) == "3"]
+    if not rows or len({r["arm"] for r in rows}) < 2:
+        return None
+
+    by_n: Dict[int, List[dict]] = defaultdict(list)
+    for r in rows:
+        by_n[int(float(r["n_points"]))].append(r)
+
+    fig, axs = plt.subplots(1, len(by_n), figsize=(6 * len(by_n), 4.2),
+                            squeeze=False)
+    axs = axs[0]
+    for ax, (n_pts, rs) in zip(axs, sorted(by_n.items())):
+        for arm in sorted({r["arm"] for r in rs}):
+            pts = sorted((r for r in rs if r["arm"] == arm),
+                         key=lambda r: int(float(r["n_obstacles"])))
+            xs = [int(float(r["n_obstacles"])) for r in pts]
+            ys = [_safe_float(r.get("makespan_avoided_s_mean")) for r in pts]
+            es = [_safe_float(r.get("makespan_avoided_s_std")) for r in pts]
+            style = "-o" if arm.endswith("minmax") else "--s"
+            lw = 2.2 if arm.endswith("minmax") else 1.3
+            ax.errorbar(xs, ys, yerr=es, fmt=style, linewidth=lw, capsize=3,
+                        label=arm, alpha=0.9)
+        ax.set_xlabel("# obstacles")
+        ax.set_ylabel("makespan (s)")
+        ax.set_title(f"n_points = {n_pts}  (3 UAVs)")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+    fig.suptitle("Makespan by arm — solid = min-max objective, dashed = min-sum")
+    fig.tight_layout()
+    out = fig_dir / "makespan_by_arm.png"
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    return out
+
+
+def _makespan_by_arm(summary: list) -> str:
+    """Makespan per arm -- the fleet metric the campaign is actually about.
+
+    Kept separate from the per-condition table because that one is organised
+    around the avoidance penalty (baseline vs avoided WITHIN a trial) and this
+    one is organised around the arms (method vs method ACROSS trials).
+    Collapsing them would put two different comparisons in one table.
+    """
+    rows = [r for r in summary if r.get("arm")]
+    if not rows or len({r["arm"] for r in rows}) < 2:
+        return ""
+
+    def pm(r, col):
+        try:
+            return f"{float(r.get(col + '_mean')):.1f} ± {float(r.get(col + '_std')):.1f}"
+        except (TypeError, ValueError):
+            return "--"
+
+    def one(r, col):
+        try:
+            return f"{float(r.get(col + '_mean')):.3f}"
+        except (TypeError, ValueError):
+            return "--"
+
+    out = [
+        "",
+        "## Makespan by arm",
+        "",
+        "Makespan is the LONGEST tour, not the total. A fleet finishes when its",
+        "slowest aircraft lands, so fleet distance can look unchanged while the",
+        "mission takes materially longer.",
+        "",
+        "| arm | n_pts | n_obs | trials | makespan avoided (s) | max tour (m) "
+        "| fleet distance (m) | balance ratio |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for r in sorted(rows, key=lambda x: (int(float(x.get("n_points") or 0)),
+                                         int(float(x.get("n_obstacles") or 0)),
+                                         str(x.get("arm")))):
+        out.append(
+            f"| {r['arm']} | {r.get('n_points')} | {r.get('n_obstacles')} "
+            f"| {r.get('n_trials')} | {pm(r, 'makespan_avoided_s')} "
+            f"| {pm(r, 'max_tour_avoided_m')} | {pm(r, 'distance_avoided_total_m')} "
+            f"| {one(r, 'balance_ratio_avoided')} |"
+        )
+    out.append("")
+    return "\n".join(out)
+
+
+def _arm_vs_reference_table(run_dir) -> str:
+    """Paired arm-against-baseline comparison -- the headline result.
+
+    Every row pairs two arms on the SAME scene, so a difference is attributable
+    to the method rather than to which scenes each arm happened to draw.
+    Negative deltas are improvements for every metric listed.
+
+    `improved/worsened` counts individual scenes, which is what distinguishes a
+    consistent effect from a mean dragged around by one or two outliers.
+    """
+    csv_path = run_dir / "arm_vs_ref_summary.csv"
+    if not csv_path.exists():
+        return ""
+    rows = _read_rows(csv_path)
+    if not rows:
+        return ""
+
+    def num(v, spec=".2f"):
+        try:
+            return format(float(v), spec)
+        except (TypeError, ValueError):
+            return "--"
+
+    def pct(v):
+        try:
+            return f"{float(v) * 100:.1f}%"
+        except (TypeError, ValueError):
+            return "--"
+
+    out = [
+        "",
+        "## Paired comparison: each arm vs the published baseline",
+        "",
+        "Paired per scene AND per fleet size; negative is better.",
+        "",
+        "Fleet size is never pooled. Only A0 and A4 are swept over it, so a "
+        "pooled mean would compare arms over different populations: pooling "
+        "put A4 at -10.2% against A2's -13.6%, reading as 'A2 beats A4', "
+        "purely because A4's figure was diluted by the 1-UAV cases where a "
+        "min-max objective has nothing to balance. At matched fleet size A4 "
+        "leads. The 1-UAV row is a deliberate negative control -- the method "
+        "SHOULD do nothing there.",
+        "",
+        "| arm | UAVs | metric | pairs | mean delta | 95% CI | mean rel. "
+        "| improved | worsened | p (paired t) |",
+        "|---|---:|---|---:|---:|---|---:|---:|---:|---:|",
+    ]
+    for r in rows:
+        out.append(
+            f"| {r['arm']} | {r.get('num_uavs', '3')} | {r['metric']} | {r['n_pairs']} "
+            f"| {num(r['mean_delta'])} "
+            f"| [{num(r['ci95_lo'])}, {num(r['ci95_hi'])}] "
+            f"| {pct(r['mean_rel_change'])} "
+            f"| {r['improved']} | {r['worsened']} "
+            f"| {num(r['pvalue_paired_t'], '.4f')} |"
+        )
+    out.append("")
+    return "\n".join(out)
 
 
 def _metric_table(summary: List[dict]) -> str:
@@ -214,9 +376,15 @@ def _failures_section(offline: List[dict]) -> str:
         lines.append("| trial_id | n_pts | n_obs | seed | residual | warning |")
         lines.append("|----------|------:|------:|-----:|---------:|---------|")
         for r in fail_rows:
+            # Escaped OUTSIDE the f-string: a backslash in an f-string
+            # expression is only legal from Python 3.12 (PEP 701), and the
+            # campaign runs on WSL's 3.10. Windows here is on 3.14, which
+            # accepts it -- so this parsed locally and failed in the only
+            # environment that matters.
+            warn = (r.get("quicknav_warning") or "").replace("|", "\\|")
             lines.append(
                 f"| {r['trial_id']} | {r['n_points']} | {r['n_obstacles']} | {r['seed']} "
-                f"| {r['residual_collisions_total']} | {(r.get('quicknav_warning') or '').replace('|', '\\|')} |"
+                f"| {r['residual_collisions_total']} | {warn} |"
             )
         lines.append("")
     if skip_rows:
@@ -250,19 +418,101 @@ def _paired_table(summary: List[dict]) -> str:
     return "\n".join(lines)
 
 
+def _gazebo_by_arm(gz_rows: List[dict], offline_by_id: Dict[str, dict]) -> str:
+    """Per-arm Gazebo makespan -- the transfer check, which is the point of S5.
+
+    The offline sweep is the measurement; Gazebo asks a narrower question: does
+    the planned makespan gain survive real controllers, or is it an artefact of
+    the planner's own time model? That is an ARM-vs-ARM question, so an 80-row
+    per-trial dump does not answer it and this table exists alongside it.
+
+    `mission_makespan_s` is wall-clock (every executor timestamp is
+    `time.perf_counter()`), which is directly comparable here only because the
+    whole campaign flies at RTF 1 -- achieved 0.9917 on the control. Mixing real-
+    time factors would require normalising by the achieved factor first.
+    """
+    by_arm: Dict[str, List[float]] = {}
+    planned_by_arm: Dict[str, List[float]] = {}
+    for r in gz_rows:
+        if r.get("status") != "ok":
+            continue
+        off = offline_by_id.get(r.get("trial_id"), {})
+        arm = (off.get("arm") or "").strip() or "unknown"
+        mk = _safe_float(r.get("mission_makespan_s"))
+        if not math.isnan(mk):
+            by_arm.setdefault(arm, []).append(mk)
+        pm = _safe_float(off.get("makespan_avoided_s"))
+        if not math.isnan(pm):
+            planned_by_arm.setdefault(arm, []).append(pm)
+    if len(by_arm) < 2:
+        return ""
+
+    def mean(v):
+        return sum(v) / len(v) if v else float("nan")
+
+    def std(v):
+        if len(v) < 2:
+            return 0.0
+        m = mean(v)
+        return math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1))
+
+    ref = "A0_published"
+    ref_mk = mean(by_arm.get(ref, [])) if ref in by_arm else float("nan")
+    ref_pl = mean(planned_by_arm.get(ref, [])) if ref in planned_by_arm else float("nan")
+
+    lines = [
+        "\n## Gazebo transfer check: flown makespan by arm\n",
+        "Does the planned makespan gain survive real controllers? "
+        "`planned` is the planner's own estimate, `flown` is the mission as "
+        "executed. Both deltas are against `A0_published`; agreement between "
+        "them is the transfer result.\n",
+        "| arm | trials | flown makespan (s) | Δ vs A0 | planned makespan (s) | Δ vs A0 |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for arm in sorted(by_arm):
+        v = by_arm[arm]
+        p = planned_by_arm.get(arm, [])
+        d_f = ((mean(v) - ref_mk) / ref_mk * 100.0
+               if ref_mk and not math.isnan(ref_mk) else float("nan"))
+        d_p = ((mean(p) - ref_pl) / ref_pl * 100.0
+               if ref_pl and not math.isnan(ref_pl) else float("nan"))
+        lines.append(
+            f"| {arm} | {len(v)} | {mean(v):.1f} ± {std(v):.1f} "
+            f"| {'--' if math.isnan(d_f) else format(d_f, '+.1f') + '%'} "
+            f"| {'--' if not p else f'{mean(p):.1f} ± {std(p):.1f}'} "
+            f"| {'--' if math.isnan(d_p) else format(d_p, '+.1f') + '%'} |"
+        )
+    return "\n".join(lines)
+
+
 def _gazebo_table(gz_rows: List[dict], offline_by_id: Dict[str, dict]) -> str:
-    lines = ["\n## Executed vs Planned (Gazebo subset)\n",
-             "| trial_id | n_pts | n_obs | mode | Planned dist (m) | Executed dist (m) | Δ (m) | Mission makespan (s) |",
-             "|----------|------:|------:|------|-----------------:|------------------:|------:|---------------------:|"]
+    """Per-trial Gazebo detail.
+
+    NOTE ON THE DISTANCE COLUMNS. `executed_total_dist_m` is NOT a measurement:
+    `deckga_execute.py:355` builds each segment from the commanded waypoint
+    (`norm(path[k] - last_xyz)`) and never reads a pose, so it is planned
+    polyline geometry. It was previously differenced against the planner's own
+    distance and labelled "Δ", which compared planned against planned and
+    printed a near-zero number that looked like flawless tracking. It is
+    labelled honestly here; real flown distance comes from
+    `campaign/bag_distance.py`, which integrates bag poses.
+    """
+    lines = ["\n## Gazebo per-trial detail\n",
+             "`commanded dist` is planned geometry, not a measurement -- see "
+             "the note in the source. Use `bag_distance.py` for flown "
+             "distance.\n",
+             "| trial_id | n_pts | n_obs | mode | status | planner dist (m) | commanded dist (m) | mission makespan (s) | collisions |",
+             "|----------|------:|------:|------|--------|-----------------:|-------------------:|---------------------:|-----------:|"]
     for r in gz_rows:
         offline = offline_by_id.get(r.get("trial_id"), {})
         plan_dist = _safe_float(offline.get("distance_avoided_total_m"))
-        exec_dist = _safe_float(r.get("executed_total_dist_m"))
-        delta = exec_dist - plan_dist if not (math.isnan(plan_dist) or math.isnan(exec_dist)) else float("nan")
+        cmd_dist = _safe_float(r.get("executed_total_dist_m"))
         lines.append(
             f"| {r['trial_id']} | {r.get('n_points', '?')} | {r.get('n_obstacles', '?')} "
-            f"| {r.get('mode', '?')} | {_fmt(plan_dist)} | {_fmt(exec_dist)} | {_fmt(delta)} "
-            f"| {_fmt(_safe_float(r.get('mission_makespan_s')))} |"
+            f"| {r.get('mode', '?')} | {r.get('status', '?')} | {_fmt(plan_dist)} "
+            f"| {_fmt(cmd_dist)} "
+            f"| {_fmt(_safe_float(r.get('mission_makespan_s')))} "
+            f"| {r.get('audit_intersections', '?')} |"
         )
     return "\n".join(lines)
 
@@ -306,6 +556,8 @@ def render(run_dir: Path) -> Path:
         md.append(f"### {name.replace('_', ' ').title()}")
         md.append(f"![{name}]({rel.as_posix()})\n")
 
+    md.append(_makespan_by_arm(summary))
+    md.append(_arm_vs_reference_table(run_dir))
     md.append(_failures_section(offline))
     md.append(_paired_table(summary))
 
@@ -314,6 +566,9 @@ def render(run_dir: Path) -> Path:
     if gz_csv.exists():
         gz_rows = _read_rows(gz_csv)
         offline_by_id = {r["trial_id"]: r for r in offline}
+        # Arm summary first: it is the transfer result. The per-trial table is
+        # 80 rows of supporting detail.
+        md.append(_gazebo_by_arm(gz_rows, offline_by_id))
         md.append(_gazebo_table(gz_rows, offline_by_id))
 
     md.append("\n## Appendix\n")
@@ -321,6 +576,9 @@ def render(run_dir: Path) -> Path:
     md.append(f"- [summary.csv]({summary_csv.relative_to(run_dir).as_posix()})")
     if gz_csv.exists():
         md.append(f"- [gazebo_master.csv]({gz_csv.relative_to(run_dir).as_posix()})")
+    arm_csv = run_dir / "arm_vs_ref_summary.csv"
+    if arm_csv.exists():
+        md.append(f"- [arm_vs_ref_summary.csv]({arm_csv.relative_to(run_dir).as_posix()})")
 
     out = run_dir / "report.md"
     out.write_text("\n".join(md), encoding="utf-8")
