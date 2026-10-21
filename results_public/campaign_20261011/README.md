@@ -2,7 +2,7 @@
 
 These are the result tables behind the EGH490-2 final report, *Minimising Mission Time in Multi-UAV Path Planning: A Makespan Reformulation of DECK-GA* (M. Solomon, QUT, 2026).
 
-They are copied unchanged from `tests/automation/results/campaign_20261011/`, which git ignores because that directory also holds about 40 GB of rosbags, media and cost caches. The procedure that produced them is in `tests/automation/campaign/RUNBOOK.md`.
+They are copied unchanged, apart from line endings, from `tests/automation/results/campaign_20261011/`, which git ignores because that directory also holds about 40 GB of rosbags, media and cost caches. The procedure that produced them is in `tests/automation/campaign/RUNBOOK.md`.
 
 | File | Rows | What it holds |
 |---|---|---|
@@ -69,9 +69,11 @@ The report therefore averages within each waypoint layout first, then tests over
 
 ## Integrity (SHA-256)
 
+These checksums are for the files as stored in this repository. Git normalises line endings to LF, so a Windows checkout with CRLF endings will not match until it is converted back to LF.
+
 ```
-ea353da40d39c924a6b325e19ea665e2bcabeaab239a7c0b7464917d9557cb18  offline_master.csv
-84240d0ecbef09b0d852e2deb0a64e08b299b5542380f616c94f5eada90c0c23  gazebo_master.csv
-12038728a9aca7100c6b2d66a4c85d41ecc17bc5764e0a5d0c60e4847ab671e6  summary.csv
-cc06f531034ca4435a42907fd3b8bc4e2f0194a615605be09d1b9baef131e5ab  arm_vs_ref_summary.csv
+a242f788582e78cccfa3682091a9d8788c4cf350c144163c0a1ce74bb793564a  offline_master.csv
+ac4f4b022cec6da93665c7e30f75a3a37f76d7156cc1832a6d41bb6c47ef23b8  gazebo_master.csv
+af5399a8fd3e7e2af585eadba556f95a0ffaf85c9553e0c41a44ff2945d55eab  summary.csv
+26e896586484910b2805c2c0da2d77d42158af9480f050c0828a7d5e5e6d2c5e  arm_vs_ref_summary.csv
 ```
